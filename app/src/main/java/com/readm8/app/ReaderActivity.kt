@@ -14,6 +14,7 @@ import android.webkit.WebViewClient
 import android.widget.*
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import org.json.JSONArray
 import java.io.File
 import java.util.concurrent.Executors
 import java.util.zip.ZipFile
@@ -26,17 +27,27 @@ class ReaderActivity : AppCompatActivity() {
     // Trạng thái đọc chung
     private var isPageMode = false
     private var menuVisible = false
-    private var themeIndex = 1 // 0: Sáng, 1: Vàng cổ, 2: Xám tối, 3: Đen đêm
+    private var themeIndex = 1 // 0: Sáng, 1: Giấy vàng, 2: Xám tối, 3: Đen đêm
     private var fontSizePx = 19
     private var useSerif = true
     private var pdfNightMode = false
 
-    // Chế độ sách chữ (EPUB / MOBI / PRC / TXT / MD / HTML / FB2)
+    // Chế độ sách chữ
     private var parsedBook: ParsedBook? = null
     private var chapterIndex = 0
     private var pendingScrollRatio = 0f
     private var currentScrollRatio = 0f
+    private var autoStartTtsNextChapter = false
     private lateinit var webView: WebView
+
+    // Nghe đọc sách (TTS)
+    private var ttsEngine: BookTtsEngine? = null
+    private var ttsBar: LinearLayout? = null
+    private var ttsStatusText: TextView? = null
+    private var btnTtsPlayPause: TextView? = null
+    private var btnTtsVoice: TextView? = null
+    private var btnTtsSpeed: TextView? = null
+    private var btnTtsTimer: TextView? = null
 
     // Chế độ trang (PDF / CBZ)
     private val renderExecutor = Executors.newSingleThreadExecutor()
@@ -48,7 +59,7 @@ class ReaderActivity : AppCompatActivity() {
     private var currentPage = 0
     private lateinit var pageImageView: PageImageView
 
-    // Giao diện thanh công cụ
+    // Thanh công cụ
     private lateinit var rootFrame: FrameLayout
     private lateinit var topBar: LinearLayout
     private lateinit var bottomBar: LinearLayout
@@ -80,6 +91,7 @@ class ReaderActivity : AppCompatActivity() {
         if (isPageMode) {
             openPageBook()
         } else {
+            initTtsEngine()
             openTextBook()
         }
     }
@@ -91,6 +103,40 @@ class ReaderActivity : AppCompatActivity() {
                 or View.SYSTEM_UI_FLAG_FULLSCREEN
                 or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
         )
+    }
+
+    private fun initTtsEngine() {
+        val savedVoiceIdx = prefs.getInt("pref_tts_voice", 0)
+            .coerceIn(0, VoiceOption.entries.lastIndex)
+        val savedSpeed = prefs.getFloat("pref_tts_speed", 1.0f)
+
+        ttsEngine = BookTtsEngine(
+            context = this,
+            onSegmentActive = { domIdx, _, _ ->
+                webView.evaluateJavascript("window.readM8Highlight($domIdx);", null)
+            },
+            onStateChanged = { playing, status ->
+                btnTtsPlayPause?.text = if (playing) "⏸" else "▶"
+                if (status.isNotEmpty()) ttsStatusText?.text = status
+            },
+            onChapterFinished = {
+                val book = parsedBook
+                if (book != null && chapterIndex + 1 < book.chapters.size) {
+                    autoStartTtsNextChapter = true
+                    loadChapter(chapterIndex + 1, 0f)
+                } else {
+                    Toast.makeText(this, "Đã đọc xong cuốn sách!", Toast.LENGTH_SHORT).show()
+                    stopTtsAndHideBar()
+                }
+            },
+            onFallbackNotice = { msg ->
+                Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+            }
+        ).apply {
+            voice = VoiceOption.entries[savedVoiceIdx]
+            speed = savedSpeed
+        }
+        updateTtsChips()
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -127,7 +173,12 @@ class ReaderActivity : AppCompatActivity() {
                 webViewClient = object : WebViewClient() {
                     override fun onPageFinished(view: WebView?, url: String?) {
                         applyWebStyle()
-                        if (pendingScrollRatio > 0f) {
+                        if (autoStartTtsNextChapter) {
+                            autoStartTtsNextChapter = false
+                            postDelayed({
+                                evaluateJavascript("window.readM8CollectTts(true);", null)
+                            }, 250)
+                        } else if (pendingScrollRatio > 0f) {
                             val r = pendingScrollRatio
                             pendingScrollRatio = 0f
                             postDelayed({
@@ -143,12 +194,73 @@ class ReaderActivity : AppCompatActivity() {
             rootFrame.addView(webView)
         }
 
+        // Thanh nghe đọc sách mini (hiện ở đáy màn hình khi bật Nghe)
+        if (!isPageMode) {
+            val bar = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setBackgroundColor(Color.parseColor("#F0181822"))
+                setPadding(dp(10), dp(8), dp(10), dp(10))
+                visibility = View.GONE
+                layoutParams = FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    Gravity.BOTTOM
+                )
+            }
+
+            val topInfoRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dp(6) }
+            }
+
+            ttsStatusText = TextView(this).apply {
+                text = "Sẵn sàng đọc"
+                setTextColor(Color.parseColor("#FFF59E0B"))
+                textSize = 12f
+                maxLines = 1
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            }
+
+            val btnCloseTts = makeBarButton("✕") { stopTtsAndHideBar() }
+            topInfoRow.addView(ttsStatusText)
+            topInfoRow.addView(btnCloseTts)
+
+            val ctrlRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+
+            val btnPrev = makeBarButton("⏮") { ttsEngine?.prevSegment() }
+            btnTtsPlayPause = makeBarButton("⏸") { ttsEngine?.togglePlayPause() }
+            val btnNext = makeBarButton("⏭") { ttsEngine?.nextSegment() }
+            btnTtsVoice = makeBarButton("Hoài My") { showVoicePicker() }
+            btnTtsSpeed = makeBarButton("1.0x") { cycleSpeed() }
+            btnTtsTimer = makeBarButton("⏱") { showSleepTimerPicker() }
+
+            ctrlRow.addView(btnPrev)
+            ctrlRow.addView(btnTtsPlayPause)
+            ctrlRow.addView(btnNext)
+            ctrlRow.addView(View(this).apply { layoutParams = LinearLayout.LayoutParams(0, 1, 1f) })
+            ctrlRow.addView(btnTtsVoice)
+            ctrlRow.addView(btnTtsSpeed)
+            ctrlRow.addView(btnTtsTimer)
+
+            bar.addView(topInfoRow)
+            bar.addView(ctrlRow)
+            ttsBar = bar
+            rootFrame.addView(bar)
+        }
+
         // Thanh trên cùng
         topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setBackgroundColor(Color.parseColor("#EE181820"))
-            setPadding(dp(10), dp(12), dp(10), dp(12))
+            setPadding(dp(8), dp(12), dp(8), dp(12))
             visibility = View.GONE
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
@@ -157,21 +269,33 @@ class ReaderActivity : AppCompatActivity() {
             )
         }
 
-        val btnBack = makeBarButton("←") { saveProgress(); finish() }
+        val btnBack = makeBarButton("←") {
+            ttsEngine?.stop()
+            saveProgress()
+            finish()
+        }
         titleText = TextView(this).apply {
             text = bookFile.nameWithoutExtension
             setTextColor(Color.WHITE)
-            textSize = 15f
+            textSize = 14f
             maxLines = 1
-            setPadding(dp(10), 0, dp(10), 0)
+            setPadding(dp(8), 0, dp(8), 0)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
-        val btnToc = makeBarButton(if (isPageMode) "Nhảy trang" else "Mục lục") {
-            if (isPageMode) showJumpPageDialog() else showTocDialog()
-        }
-
         topBar.addView(btnBack)
         topBar.addView(titleText)
+
+        if (!isPageMode) {
+            val btnListen = makeBarButton("🎧 Nghe") {
+                if (menuVisible) toggleMenu()
+                startTtsFromCurrentView()
+            }
+            topBar.addView(btnListen)
+        }
+
+        val btnToc = makeBarButton(if (isPageMode) "Trang" else "Mục lục") {
+            if (isPageMode) showJumpPageDialog() else showTocDialog()
+        }
         topBar.addView(btnToc)
 
         // Thanh dưới cùng
@@ -209,7 +333,11 @@ class ReaderActivity : AppCompatActivity() {
                 override fun onStartTrackingTouch(sb: SeekBar?) {}
                 override fun onStopTrackingTouch(sb: SeekBar?) {
                     val p = sb?.progress ?: return
-                    if (isPageMode) goToPage(p) else loadChapter(p, 0f)
+                    if (isPageMode) goToPage(p) else {
+                        ttsEngine?.stop()
+                        ttsBar?.visibility = View.GONE
+                        loadChapter(p, 0f)
+                    }
                 }
             })
         }
@@ -261,9 +389,9 @@ class ReaderActivity : AppCompatActivity() {
         return TextView(this).apply {
             text = label
             setTextColor(Color.WHITE)
-            textSize = 13f
+            textSize = 12f
             gravity = Gravity.CENTER
-            setPadding(dp(12), dp(8), dp(12), dp(8))
+            setPadding(dp(10), dp(7), dp(10), dp(7))
             background = GradientDrawable().apply {
                 setColor(Color.parseColor("#FF2A2A35"))
                 cornerRadius = dp(8).toFloat()
@@ -271,7 +399,7 @@ class ReaderActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(dp(4), 0, dp(4), 0) }
+            ).apply { setMargins(dp(3), 0, dp(3), 0) }
             setOnClickListener { onClick() }
         }
     }
@@ -281,6 +409,68 @@ class ReaderActivity : AppCompatActivity() {
         topBar.visibility = if (menuVisible) View.VISIBLE else View.GONE
         bottomBar.visibility = if (menuVisible) View.VISIBLE else View.GONE
         if (!menuVisible) hideSystemUI()
+    }
+
+    // ==================== ĐIỀU KHIỂN NGHE ĐỌC SÁCH ====================
+    private fun startTtsFromCurrentView() {
+        ttsBar?.visibility = View.VISIBLE
+        ttsStatusText?.text = "Đang chuẩn bị giọng đọc..."
+        webView.evaluateJavascript("window.readM8CollectTts(false);", null)
+    }
+
+    private fun stopTtsAndHideBar() {
+        ttsEngine?.stop()
+        ttsBar?.visibility = View.GONE
+        webView.evaluateJavascript("window.readM8ClearHighlight();", null)
+    }
+
+    private fun showVoicePicker() {
+        val engine = ttsEngine ?: return
+        val options = VoiceOption.entries
+        val labels = options.map { it.label }.toTypedArray()
+        val curIdx = options.indexOf(engine.voice)
+        AlertDialog.Builder(this)
+            .setTitle("Chọn giọng đọc")
+            .setSingleChoiceItems(labels, curIdx) { dialog, which ->
+                val chosen = options[which]
+                prefs.edit().putInt("pref_tts_voice", which).apply()
+                engine.updateVoiceOrSpeed(chosen, engine.speed)
+                updateTtsChips()
+                dialog.dismiss()
+            }
+            .show()
+    }
+
+    private fun cycleSpeed() {
+        val engine = ttsEngine ?: return
+        val speeds = listOf(0.85f, 1.0f, 1.15f, 1.3f, 1.5f)
+        val curIdx = speeds.indexOfFirst { kotlin.math.abs(it - engine.speed) < 0.05f }
+        val nextSpeed = speeds[(curIdx + 1) % speeds.size]
+        prefs.edit().putFloat("pref_tts_speed", nextSpeed).apply()
+        engine.updateVoiceOrSpeed(engine.voice, nextSpeed)
+        updateTtsChips()
+    }
+
+    private fun showSleepTimerPicker() {
+        val engine = ttsEngine ?: return
+        val choices = arrayOf("Tắt hẹn giờ", "15 phút", "30 phút", "60 phút")
+        val mins = intArrayOf(0, 15, 30, 60)
+        AlertDialog.Builder(this)
+            .setTitle("Hẹn giờ tắt đọc sách")
+            .setItems(choices) { _, which ->
+                val m = mins[which]
+                engine.setSleepTimer(m)
+                btnTtsTimer?.text = if (m > 0) "⏱${m}p" else "⏱"
+                val msg = if (m > 0) "Sẽ tự dừng sau $m phút" else "Đã tắt hẹn giờ"
+                Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+            }
+            .show()
+    }
+
+    private fun updateTtsChips() {
+        val engine = ttsEngine ?: return
+        btnTtsVoice?.text = engine.voice.shortLabel
+        btnTtsSpeed?.text = "${engine.speed}x"
     }
 
     // ==================== CHẾ ĐỘ SÁCH CHỮ ====================
@@ -326,7 +516,7 @@ class ReaderActivity : AppCompatActivity() {
             <style id="readm8-style">
               html, body {
                 margin: 0 !important;
-                padding: 18px 18px 42px 18px !important;
+                padding: 18px 18px 96px 18px !important;
                 line-height: 1.65 !important;
                 text-align: justify;
                 word-wrap: break-word;
@@ -376,6 +566,63 @@ class ReaderActivity : AppCompatActivity() {
                   }, 320);
                 };
 
+                window.readM8CollectTts = function(fromTop) {
+                  var prev = document.querySelectorAll('[data-tts-idx]');
+                  for (var k = 0; k < prev.length; k++) prev[k].removeAttribute('data-tts-idx');
+
+                  var nodes = Array.prototype.slice.call(document.querySelectorAll('p, h1, h2, h3, h4, h5, h6, li, blockquote'));
+                  var filtered = [];
+                  for (var i = 0; i < nodes.length; i++) {
+                    var n = nodes[i];
+                    if (n.querySelector('p, h1, h2, h3, h4, li, blockquote')) continue;
+                    var txt = (n.innerText || n.textContent || '').replace(/\s+/g, ' ').trim();
+                    if (txt.length >= 2) filtered.push({el: n, txt: txt});
+                  }
+                  if (filtered.length === 0) {
+                    var divs = Array.prototype.slice.call(document.querySelectorAll('div'));
+                    for (var d = 0; d < divs.length; d++) {
+                      if (divs[d].querySelector('div, p')) continue;
+                      var dt = (divs[d].innerText || '').replace(/\s+/g, ' ').trim();
+                      if (dt.length >= 2) filtered.push({el: divs[d], txt: dt});
+                    }
+                  }
+                  if (filtered.length === 0) {
+                    var allTxt = (document.body.innerText || '').replace(/\s+/g, ' ').trim();
+                    if (allTxt.length >= 2) filtered.push({el: document.body, txt: allTxt});
+                  }
+
+                  var texts = [];
+                  var startIdx = 0;
+                  var foundVisible = false;
+                  for (var j = 0; j < filtered.length; j++) {
+                    filtered[j].el.setAttribute('data-tts-idx', String(j));
+                    texts.push(filtered[j].txt);
+                    if (!fromTop && !foundVisible) {
+                      var rect = filtered[j].el.getBoundingClientRect();
+                      if (rect.bottom > 24 && rect.top < window.innerHeight) {
+                        startIdx = j;
+                        foundVisible = true;
+                      }
+                    }
+                  }
+                  ReadM8.onTtsData(startIdx, JSON.stringify(texts));
+                };
+
+                window.readM8Highlight = function(idx) {
+                  var old = document.querySelectorAll('.readm8-speaking');
+                  for (var i = 0; i < old.length; i++) old[i].classList.remove('readm8-speaking');
+                  var el = document.querySelector('[data-tts-idx="' + idx + '"]');
+                  if (el) {
+                    el.classList.add('readm8-speaking');
+                    el.scrollIntoView({behavior: 'smooth', block: 'center'});
+                  }
+                };
+
+                window.readM8ClearHighlight = function() {
+                  var old = document.querySelectorAll('.readm8-speaking');
+                  for (var i = 0; i < old.length; i++) old[i].classList.remove('readm8-speaking');
+                };
+
                 var timer = null;
                 window.addEventListener('scroll', function() {
                   clearTimeout(timer);
@@ -399,10 +646,10 @@ class ReaderActivity : AppCompatActivity() {
     }
 
     private fun themeColors(): Pair<String, String> = when (themeIndex) {
-        0 -> "#FFFFFF" to "#1F1F24" // Sáng
-        1 -> "#F4ECD8" to "#3B2E1E" // Vàng cổ
-        2 -> "#202124" to "#D8D8DF" // Xám tối
-        else -> "#000000" to "#B8B8C0" // Đen đêm
+        0 -> "#FFFFFF" to "#1F1F24"
+        1 -> "#F4ECD8" to "#3B2E1E"
+        2 -> "#202124" to "#D8D8DF"
+        else -> "#000000" to "#B8B8C0"
     }
 
     private fun themeName(): String = when (themeIndex) {
@@ -425,7 +672,10 @@ class ReaderActivity : AppCompatActivity() {
         webView.setBackgroundColor(Color.parseColor(bg))
         val js = """
             (function(){
-              var css = "html, body, p, div, span, li, blockquote, h1, h2, h3, h4 { background-color: $bg !important; color: $fg !important; font-family: $font !important; } body { font-size: ${fontSizePx}px !important; }";
+              var css = "html, body { background-color: $bg !important; color: $fg !important; font-family: $font !important; font-size: ${fontSizePx}px !important; } " +
+                        "body * { background-color: transparent !important; color: $fg !important; font-family: $font !important; } " +
+                        "body .readm8-speaking { background-color: rgba(245, 158, 11, 0.28) !important; border-radius: 6px; padding: 2px 4px; } " +
+                        "body .readm8-speaking * { background-color: transparent !important; }";
               var st = document.getElementById('readm8-dynamic');
               if (!st) { st = document.createElement('style'); st.id = 'readm8-dynamic'; document.head.appendChild(st); }
               st.textContent = css;
@@ -440,6 +690,8 @@ class ReaderActivity : AppCompatActivity() {
         AlertDialog.Builder(this)
             .setTitle("Mục lục (${book.chapters.size})")
             .setSingleChoiceItems(titles, chapterIndex) { dialog, which ->
+                ttsEngine?.stop()
+                ttsBar?.visibility = View.GONE
                 loadChapter(which, 0f)
                 dialog.dismiss()
                 if (menuVisible) toggleMenu()
@@ -476,6 +728,22 @@ class ReaderActivity : AppCompatActivity() {
         @JavascriptInterface
         fun onProgress(ratio: Float) {
             currentScrollRatio = ratio
+        }
+
+        @JavascriptInterface
+        fun onTtsData(startIdx: Int, jsonArrayStr: String) {
+            runOnUiThread {
+                val paragraphs = runCatching {
+                    val arr = JSONArray(jsonArrayStr)
+                    List(arr.length()) { i -> arr.optString(i, "") }
+                }.getOrDefault(emptyList())
+                if (paragraphs.isEmpty()) {
+                    Toast.makeText(this@ReaderActivity, "Chương này không có văn bản để đọc", Toast.LENGTH_SHORT).show()
+                    stopTtsAndHideBar()
+                } else {
+                    ttsEngine?.start(paragraphs, startIdx)
+                }
+            }
         }
     }
 
@@ -590,8 +858,12 @@ class ReaderActivity : AppCompatActivity() {
             .show()
     }
 
-    // ==================== PHÍM ÂM LƯỢNG LẬT TRANG ====================
+    // ==================== PHÍM ÂM LƯỢNG ====================
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        // Khi đang nghe đọc sách thì trả phím âm lượng về tăng/giảm loa bình thường
+        if (ttsEngine?.isPlaying == true) {
+            return super.onKeyDown(keyCode, event)
+        }
         if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
             if (isPageMode) goToPage(currentPage + 1)
             else webView.evaluateJavascript("window.readM8Step(1);", null)
@@ -625,6 +897,7 @@ class ReaderActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        ttsEngine?.release()
         renderExecutor.execute {
             runCatching { pdfRenderer?.close() }
             runCatching { pdfFd?.close() }
@@ -637,9 +910,6 @@ class ReaderActivity : AppCompatActivity() {
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 }
 
-/**
- * ImageView hỗ trợ zoom 2 ngón, kéo trang và chạm 3 vùng lật trang cho PDF / CBZ
- */
 class PageImageView(
     context: Context,
     private val onTapLeft: () -> Unit,
