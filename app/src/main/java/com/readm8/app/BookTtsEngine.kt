@@ -9,18 +9,38 @@ import android.os.Looper
 import android.os.PowerManager
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
-import okhttp3.*
+import android.text.TextUtils
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
 import okio.ByteString
+import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
-import java.util.*
-import java.util.concurrent.*
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
+import java.util.UUID
+import java.util.concurrent.Callable
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
-enum class VoiceOption(val label: String, val shortLabel: String, val edgeName: String, val isOnline: Boolean) {
+enum class VoiceOption(
+    val label: String,
+    val shortLabel: String,
+    val edgeName: String,
+    val isOnline: Boolean
+) {
     HOAI_MY("AI Nữ – Hoài My (Online)", "Hoài My", "vi-VN-HoaiMyNeural", true),
     NAM_MINH("AI Nam – Nam Minh (Online)", "Nam Minh", "vi-VN-NamMinhNeural", true),
     OFFLINE("Giọng trên máy (Offline)", "Offline", "", false)
@@ -78,6 +98,70 @@ class BookTtsEngine(
         initOfflineTts()
     }
 
+    private fun acquireWakeLock() {
+        runCatching {
+            if (wakeLock == null) {
+                val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ReadM8:TtsWakeLock")
+            }
+            if (wakeLock?.isHeld == false) {
+                wakeLock?.acquire(2 * 60 * 60 * 1000L)
+            }
+        }
+    }
+
+    private fun releaseWakeLock() {
+        runCatching {
+            if (wakeLock?.isHeld == true) wakeLock?.release()
+        }
+    }
+
+    private fun cleanCacheFiles() {
+        runCatching {
+            ttsCacheDir.listFiles()?.forEach { it.delete() }
+        }
+    }
+
+    private fun buildSegments(paragraphs: List<String>): List<TtsSegment> {
+        val out = mutableListOf<TtsSegment>()
+        for ((domIdx, raw) in paragraphs.withIndex()) {
+            val cleaned = raw.replace(Regex("\\s+"), " ").trim()
+            if (cleaned.length < 2) continue
+            if (cleaned.length <= 300) {
+                out.add(TtsSegment(domIdx, cleaned))
+                continue
+            }
+            var start = 0
+            while (start < cleaned.length) {
+                val maxEnd = (start + 280).coerceAtMost(cleaned.length)
+                if (maxEnd >= cleaned.length) {
+                    out.add(TtsSegment(domIdx, cleaned.substring(start).trim()))
+                    break
+                }
+                val slice = cleaned.substring(start, maxEnd)
+                val cutSentence = listOf(
+                    slice.lastIndexOf(". "),
+                    slice.lastIndexOf("! "),
+                    slice.lastIndexOf("? "),
+                    slice.lastIndexOf("; ")
+                ).maxOrNull() ?: -1
+                val cutComma = slice.lastIndexOf(", ")
+                val cutSpace = slice.lastIndexOf(' ')
+                val cut = when {
+                    cutSentence > 80 -> start + cutSentence + 1
+                    cutComma > 120 -> start + cutComma + 1
+                    cutSpace > 60 -> start + cutSpace
+                    else -> maxEnd
+                }
+                val part = cleaned.substring(start, cut).trim()
+                if (part.isNotEmpty()) out.add(TtsSegment(domIdx, part))
+                start = cut
+                while (start < cleaned.length && cleaned[start] == ' ') start++
+            }
+        }
+        return out
+    }
+
     private fun initOfflineTts() {
         offlineTts = TextToSpeech(context.applicationContext) { status ->
             if (status == TextToSpeech.SUCCESS) {
@@ -86,28 +170,25 @@ class BookTtsEngine(
                 offlineTts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                     override fun onStart(utteranceId: String?) {}
                     override fun onDone(utteranceId: String?) {
-                        val parts = utteranceId?.split("_") ?: return
-                        val sess = parts.getOrNull(0)?.toIntOrNull() ?: return
-                        val idx = parts.getOrNull(1)?.toIntOrNull() ?: return
-                        mainHandler.post {
-                            if (sess == sessionCounter.get() && isPlaying) {
-                                playSegmentInternal(sess, idx + 1)
-                            }
-                        }
+                        advanceFromUtterance(utteranceId)
                     }
 
                     @Deprecated("Deprecated in Java")
                     override fun onError(utteranceId: String?) {
-                        val parts = utteranceId?.split("_") ?: return
-                        val sess = parts.getOrNull(0)?.toIntOrNull() ?: return
-                        val idx = parts.getOrNull(1)?.toIntOrNull() ?: return
-                        mainHandler.post {
-                            if (sess == sessionCounter.get() && isPlaying) {
-                                playSegmentInternal(sess, idx + 1)
-                            }
-                        }
+                        advanceFromUtterance(utteranceId)
                     }
                 })
+            }
+        }
+    }
+
+    private fun advanceFromUtterance(utteranceId: String?) {
+        val parts = utteranceId?.split("_") ?: return
+        val sess = parts.getOrNull(0)?.toIntOrNull() ?: return
+        val idx = parts.getOrNull(1)?.toIntOrNull() ?: return
+        mainHandler.post {
+            if (sess == sessionCounter.get() && isPlaying) {
+                playSegmentInternal(sess, idx + 1)
             }
         }
     }
@@ -119,11 +200,8 @@ class BookTtsEngine(
             onStateChanged(false, "Không có chữ để đọc")
             return
         }
-
-        val startSeg = segments.indexOfFirst { it.domIndex >= startDomIndex }.let {
-            if (it >= 0) it else 0
-        }
-        currentSegIndex = startSeg
+        val found = segments.indexOfFirst { it.domIndex >= startDomIndex }
+        currentSegIndex = if (found >= 0) found else 0
         isActive = true
         isPlaying = true
         fallbackNoticeShown = false
@@ -150,17 +228,17 @@ class BookTtsEngine(
         } else {
             isPlaying = true
             acquireWakeLock()
-            var resumedMp = false
+            var resumed = false
             synchronized(playerLock) {
                 val mp = mediaPlayer
                 if (mp != null && voice.isOnline) {
-                    resumedMp = runCatching {
+                    resumed = runCatching {
                         mp.start()
                         true
                     }.getOrDefault(false)
                 }
             }
-            if (resumedMp) {
+            if (resumed) {
                 onStateChanged(true, "Đang đọc (${voice.shortLabel})")
             } else {
                 val session = sessionCounter.incrementAndGet()
@@ -171,14 +249,12 @@ class BookTtsEngine(
 
     fun nextSegment() {
         if (!isActive || segments.isEmpty()) return
-        val next = (currentSegIndex + 1).coerceAtMost(segments.lastIndex)
-        jumpToSegment(next)
+        jumpToSegment((currentSegIndex + 1).coerceAtMost(segments.lastIndex))
     }
 
     fun prevSegment() {
         if (!isActive || segments.isEmpty()) return
-        val prev = (currentSegIndex - 1).coerceAtLeast(0)
-        jumpToSegment(prev)
+        jumpToSegment((currentSegIndex - 1).coerceAtLeast(0))
     }
 
     fun updateVoiceOrSpeed(newVoice: VoiceOption, newSpeed: Float) {
@@ -196,13 +272,13 @@ class BookTtsEngine(
         sleepMinutesLeft = minutes
         if (minutes <= 0) return
 
-        val r = Runnable {
+        val task = Runnable {
             sleepMinutesLeft = 0
             if (isPlaying) togglePlayPause()
             onFallbackNotice("Đã hết giờ hẹn ngủ, tạm dừng đọc sách.")
         }
-        sleepRunnable = r
-        mainHandler.postDelayed(r, minutes * 60_000L)
+        sleepRunnable = task
+        mainHandler.postDelayed(task, minutes * 60_000L)
     }
 
     fun stop() {
@@ -362,7 +438,6 @@ class BookTtsEngine(
         tts.speak(text, TextToSpeech.QUEUE_FLUSH, params, uid)
     }
 
-    // ==================== MICROSOFT EDGE NEURAL TTS ====================
     private fun synthesizeEdgeTts(
         session: Int,
         index: Int,
@@ -403,12 +478,22 @@ class BookTtsEngine(
         val ts = utcTimestamp()
         val reqId = UUID.randomUUID().toString().replace("-", "")
 
+        val metaJson = JSONObject()
+            .put("sentenceBoundaryEnabled", "false")
+            .put("wordBoundaryEnabled", "false")
+        val audioJson = JSONObject()
+            .put("metadataoptions", metaJson)
+            .put("outputFormat", "audio-24khz-48kbitrate-mono-mp3")
+        val cfgBody = JSONObject()
+            .put("context", JSONObject().put("synthesis", JSONObject().put("audio", audioJson)))
+            .toString()
+
         val ws = httpClient.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 val configMsg = "X-Timestamp:$ts\r\n" +
                     "Content-Type:application/json; charset=utf-8\r\n" +
                     "Path:speech.config\r\n\r\n" +
-                    "{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"false\"},\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}"
+                    cfgBody
                 webSocket.send(configMsg)
 
                 val ssmlMsg = "X-RequestId:$reqId\r\n" +
@@ -485,83 +570,8 @@ class BookTtsEngine(
     }
 
     private fun escapeXml(input: String): String {
-        val sb = StringBuilder(input.length)
-        for (ch in input) {
-            when (ch) {
-                '&' -> sb.append("&")
-                '<' -> sb.append("<")
-                '>' -> sb.append(">")
-                '"' -> sb.append(""")
-                '\'' -> sb.append("'")
-                else -> if (ch.code >= 0x20 || ch == '\n' || ch == '\r' || ch == '\t') {
-                    sb.append(ch)
-                }
-            }
-        }
-        return sb.toString().trim()
-    }
-
-    private fun buildSegments(paragraphs: List<String>): List<TtsSegment> {
-        val out = mutableListOf<TtsSegment>()
-        paragraphs.forEachIndexed { domIdx, raw ->
-            val cleaned = raw.replace(Regex("\\s+"), " ").trim()
-            if (cleaned.length < 2) return@forEachIndexed
-            if (cleaned.length <= 300) {
-                out.add(TtsSegment(domIdx, cleaned))
-            } else {
-                var start = 0
-                while (start < cleaned.length) {
-                    val maxEnd = (start + 280).coerceAtMost(cleaned.length)
-                    if (maxEnd >= cleaned.length) {
-                        out.add(TtsSegment(domIdx, cleaned.substring(start).trim()))
-                        break
-                    }
-                    val slice = cleaned.substring(start, maxEnd)
-                    val cutSentence = maxOf(
-                        slice.lastIndexOf(". "),
-                        slice.lastIndexOf("! "),
-                        slice.lastIndexOf("? "),
-                        slice.lastIndexOf("; ")
-                    )
-                    val cutComma = slice.lastIndexOf(", ")
-                    val cutSpace = slice.lastIndexOf(' ')
-                    val cut = when {
-                        cutSentence > 80 -> start + cutSentence + 1
-                        cutComma > 120 -> start + cutComma + 1
-                        cutSpace > 60 -> start + cutSpace
-                        else -> maxEnd
-                    }
-                    val part = cleaned.substring(start, cut).trim()
-                    if (part.isNotEmpty()) out.add(TtsSegment(domIdx, part))
-                    start = cut
-                    while (start < cleaned.length && cleaned[start] == ' ') start++
-                }
-            }
-        }
-        return out
-    }
-
-    private fun acquireWakeLock() {
-        runCatching {
-            if (wakeLock == null) {
-                val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
-                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ReadM8:TtsWakeLock")
-            }
-            if (wakeLock?.isHeld == false) {
-                wakeLock?.acquire(2 * 60 * 60 * 1000L)
-            }
-        }
-    }
-
-    private fun releaseWakeLock() {
-        runCatching {
-            if (wakeLock?.isHeld == true) wakeLock?.release()
-        }
-    }
-
-    private fun cleanCacheFiles() {
-        runCatching {
-            ttsCacheDir.listFiles()?.forEach { it.delete() }
-        }
+        val filtered = input.filter { it.code >= 32 || it == '\n' || it == '\r' || it == '\t' }
+        return TextUtils.htmlEncode(filtered).trim()
     }
 }
+// END BookTtsEngine
