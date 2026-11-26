@@ -17,6 +17,7 @@ import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.*
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 enum class VoiceOption(val label: String, val shortLabel: String, val edgeName: String, val isOnline: Boolean) {
@@ -266,7 +267,6 @@ class BookTtsEngine(
             return
         }
 
-        // Tải trước 2 câu kế tiếp để đọc liền mạch
         val currentFuture = ensurePrefetch(session, index)
         if (index + 1 < segments.size) ensurePrefetch(session, index + 1)
         if (index + 2 < segments.size) ensurePrefetch(session, index + 2)
@@ -289,13 +289,18 @@ class BookTtsEngine(
     }
 
     private fun ensurePrefetch(session: Int, index: Int): Future<File?> {
-        return prefetchMap.computeIfAbsent(index) {
-            fetchExecutor.submit(Callable {
-                if (session != sessionCounter.get()) return@Callable null
-                val seg = segments.getOrNull(index) ?: return@Callable null
-                synthesizeEdgeTts(session, index, seg.text, voice.edgeName, speed)
-            })
+        prefetchMap[index]?.let { return it }
+        val future = fetchExecutor.submit(Callable {
+            if (session != sessionCounter.get()) return@Callable null
+            val seg = segments.getOrNull(index) ?: return@Callable null
+            synthesizeEdgeTts(session, index, seg.text, voice.edgeName, speed)
+        })
+        val existing = prefetchMap.putIfAbsent(index, future)
+        if (existing != null) {
+            future.cancel(true)
+            return existing
         }
+        return future
     }
 
     private fun playMp3File(session: Int, index: Int, file: File) {
@@ -391,7 +396,7 @@ class BookTtsEngine(
 
         val audioOut = ByteArrayOutputStream(32768)
         val latch = CountDownLatch(1)
-        @Volatile var completed = false
+        val completed = AtomicBoolean(false)
 
         val pct = ((rateMultiplier - 1.0f) * 100f).toInt().coerceIn(-50, 100)
         val rateStr = if (pct >= 0) "+$pct%" else "$pct%"
@@ -431,7 +436,7 @@ class BookTtsEngine(
 
             override fun onMessage(webSocket: WebSocket, text: String) {
                 if (text.contains("Path:turn.end")) {
-                    completed = true
+                    completed.set(true)
                     webSocket.close(1000, "done")
                     latch.countDown()
                 }
@@ -449,7 +454,7 @@ class BookTtsEngine(
         val finishedInTime = latch.await(15, TimeUnit.SECONDS)
         if (!finishedInTime) ws.cancel()
 
-        if (!completed || audioOut.size() < 100 || session != sessionCounter.get()) {
+        if (!completed.get() || audioOut.size() < 100 || session != sessionCounter.get()) {
             return null
         }
 
@@ -488,7 +493,9 @@ class BookTtsEngine(
                 '>' -> sb.append(">")
                 '"' -> sb.append(""")
                 '\'' -> sb.append("'")
-                else -> if (ch.code >= 0x20 || ch == '\n' || ch == '\r' || ch == '\t') sb.append(ch)
+                else -> if (ch.code >= 0x20 || ch == '\n' || ch == '\r' || ch == '\t') {
+                    sb.append(ch)
+                }
             }
         }
         return sb.toString().trim()
@@ -502,7 +509,6 @@ class BookTtsEngine(
             if (cleaned.length <= 300) {
                 out.add(TtsSegment(domIdx, cleaned))
             } else {
-                // Tách đoạn quá dài theo dấu câu để câu đầu phát cực nhanh (~0.5 giây)
                 var start = 0
                 while (start < cleaned.length) {
                     val maxEnd = (start + 280).coerceAtMost(cleaned.length)
@@ -542,7 +548,7 @@ class BookTtsEngine(
                 wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ReadM8:TtsWakeLock")
             }
             if (wakeLock?.isHeld == false) {
-                wakeLock?.acquire(2 * 60 * 60 * 1000L) // Tối đa 2 giờ
+                wakeLock?.acquire(2 * 60 * 60 * 1000L)
             }
         }
     }
