@@ -14,9 +14,14 @@ import android.webkit.WebViewClient
 import android.widget.*
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
+import com.tom_roush.pdfbox.io.MemoryUsageSetting
+import com.tom_roush.pdfbox.pdmodel.PDDocument
+import com.tom_roush.pdfbox.text.PDFTextStripper
 import org.json.JSONArray
 import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.ZipFile
 import kotlin.math.abs
 
@@ -27,6 +32,8 @@ class ReaderActivity : AppCompatActivity() {
 
     // Trạng thái đọc chung
     private var isPageMode = false
+    private var isPdfMode = false
+    private val canUseTts: Boolean get() = !isPageMode || isPdfMode
     private var menuVisible = false
     private var themeIndex = 1 // 0: Sáng, 1: Giấy vàng, 2: Xám tối, 3: Đen đêm
     private var fontSizePx = 19
@@ -41,7 +48,7 @@ class ReaderActivity : AppCompatActivity() {
     private var autoStartTtsNextChapter = false
     private lateinit var webView: WebView
 
-    // Nghe đọc sách (TTS)
+    // Nghe đọc sách (TTS cho cả sách chữ và PDF)
     private var ttsEngine: BookTtsEngine? = null
     private var ttsBar: LinearLayout? = null
     private var ttsStatusText: TextView? = null
@@ -49,6 +56,13 @@ class ReaderActivity : AppCompatActivity() {
     private var btnTtsVoice: TextView? = null
     private var btnTtsSpeed: TextView? = null
     private var btnTtsTimer: TextView? = null
+
+    // Tách chữ PDF nền (chỉ nạp khi bấm Nghe để tiết kiệm RAM)
+    private val pdfTextExecutor = Executors.newSingleThreadExecutor()
+    private val pdfTtsRequestId = AtomicInteger(0)
+    private var pdfBoxInitialized = false
+    private var pdfTextDoc: PDDocument? = null
+    private var pdfBlankSkipCount = 0
 
     // Chế độ trang (PDF / CBZ)
     private val renderExecutor = Executors.newSingleThreadExecutor()
@@ -86,13 +100,16 @@ class ReaderActivity : AppCompatActivity() {
         pdfNightMode = prefs.getBoolean("pref_pdf_night", false)
 
         isPageMode = BookParsers.isPageBased(bookFile)
+        isPdfMode = bookFile.extension.equals("pdf", true)
         buildUi()
         hideSystemUI()
 
+        if (canUseTts) {
+            initTtsEngine()
+        }
         if (isPageMode) {
             openPageBook()
         } else {
-            initTtsEngine()
             openTextBook()
         }
     }
@@ -114,20 +131,37 @@ class ReaderActivity : AppCompatActivity() {
         ttsEngine = BookTtsEngine(
             context = this,
             onSegmentActive = { domIdx, _, _ ->
-                webView.evaluateJavascript("window.readM8Highlight($domIdx);", null)
+                if (!isPageMode) {
+                    webView.evaluateJavascript("window.readM8Highlight($domIdx);", null)
+                }
             },
             onStateChanged = { playing, status ->
                 btnTtsPlayPause?.text = if (playing) "⏸" else "▶"
-                if (status.isNotEmpty()) ttsStatusText?.text = status
+                if (status.isNotEmpty()) {
+                    ttsStatusText?.text = if (isPdfMode && totalPages > 0) {
+                        "Tr.${currentPage + 1}/$totalPages • $status"
+                    } else {
+                        status
+                    }
+                }
             },
             onChapterFinished = {
-                val book = parsedBook
-                if (book != null && chapterIndex + 1 < book.chapters.size) {
-                    autoStartTtsNextChapter = true
-                    loadChapter(chapterIndex + 1, 0f)
+                if (isPdfMode) {
+                    if (currentPage + 1 < totalPages) {
+                        goToPage(currentPage + 1, autoPlayTts = true)
+                    } else {
+                        Toast.makeText(this, "Đã đọc xong file PDF!", Toast.LENGTH_SHORT).show()
+                        stopTtsAndHideBar()
+                    }
                 } else {
-                    Toast.makeText(this, "Đã đọc xong cuốn sách!", Toast.LENGTH_SHORT).show()
-                    stopTtsAndHideBar()
+                    val book = parsedBook
+                    if (book != null && chapterIndex + 1 < book.chapters.size) {
+                        autoStartTtsNextChapter = true
+                        loadChapter(chapterIndex + 1, 0f)
+                    } else {
+                        Toast.makeText(this, "Đã đọc xong cuốn sách!", Toast.LENGTH_SHORT).show()
+                        stopTtsAndHideBar()
+                    }
                 }
             },
             onFallbackNotice = { msg ->
@@ -195,8 +229,8 @@ class ReaderActivity : AppCompatActivity() {
             rootFrame.addView(webView)
         }
 
-        // Thanh nghe đọc sách mini (hiện ở đáy màn hình khi bật Nghe)
-        if (!isPageMode) {
+        // Thanh nghe đọc sách mini (dùng cho cả sách chữ và PDF)
+        if (canUseTts) {
             val bar = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 setBackgroundColor(Color.parseColor("#F0181822"))
@@ -271,6 +305,7 @@ class ReaderActivity : AppCompatActivity() {
         }
 
         val btnBack = makeBarButton("←") {
+            pdfTtsRequestId.incrementAndGet()
             ttsEngine?.stop()
             saveProgress()
             finish()
@@ -286,7 +321,7 @@ class ReaderActivity : AppCompatActivity() {
         topBar.addView(btnBack)
         topBar.addView(titleText)
 
-        if (!isPageMode) {
+        if (canUseTts) {
             val btnListen = makeBarButton("🎧 Nghe") {
                 if (menuVisible) toggleMenu()
                 startTtsFromCurrentView()
@@ -415,14 +450,118 @@ class ReaderActivity : AppCompatActivity() {
     // ==================== ĐIỀU KHIỂN NGHE ĐỌC SÁCH ====================
     private fun startTtsFromCurrentView() {
         ttsBar?.visibility = View.VISIBLE
-        ttsStatusText?.text = "Đang chuẩn bị giọng đọc..."
-        webView.evaluateJavascript("window.readM8CollectTts(false);", null)
+        if (isPdfMode) {
+            pdfBlankSkipCount = 0
+            startPdfTtsForPage(currentPage, isAutoNext = false)
+        } else {
+            ttsStatusText?.text = "Đang chuẩn bị giọng đọc..."
+            webView.evaluateJavascript("window.readM8CollectTts(false);", null)
+        }
     }
 
     private fun stopTtsAndHideBar() {
+        pdfTtsRequestId.incrementAndGet()
         ttsEngine?.stop()
         ttsBar?.visibility = View.GONE
-        webView.evaluateJavascript("window.readM8ClearHighlight();", null)
+        if (!isPageMode) {
+            webView.evaluateJavascript("window.readM8ClearHighlight();", null)
+        }
+    }
+
+    private fun ensurePdfTextDoc(): PDDocument? {
+        pdfTextDoc?.let { return it }
+        if (!pdfBoxInitialized) {
+            PDFBoxResourceLoader.init(applicationContext)
+            pdfBoxInitialized = true
+        }
+        val mem = MemoryUsageSetting.setupTempFileOnly()
+        mem.setTempDir(cacheDir)
+        val doc = PDDocument.load(bookFile, mem)
+        pdfTextDoc = doc
+        return doc
+    }
+
+    private fun startPdfTtsForPage(pageIndex: Int, isAutoNext: Boolean) {
+        if (!isPdfMode || totalPages <= 0) return
+        val reqId = pdfTtsRequestId.incrementAndGet()
+        ttsEngine?.stop()
+        ttsBar?.visibility = View.VISIBLE
+        ttsStatusText?.text = "Đang tách chữ trang ${pageIndex + 1}..."
+
+        pdfTextExecutor.execute {
+            val paragraphs = runCatching {
+                val doc = ensurePdfTextDoc() ?: return@runCatching emptyList()
+                val pageNum = pageIndex + 1
+                if (pageNum !in 1..doc.numberOfPages) return@runCatching emptyList()
+                val stripper = PDFTextStripper().apply {
+                    sortByPosition = true
+                    startPage = pageNum
+                    endPage = pageNum
+                }
+                extractPdfParagraphs(stripper.getText(doc))
+            }.getOrDefault(emptyList())
+
+            runOnUiThread {
+                if (reqId != pdfTtsRequestId.get() || isFinishing || isDestroyed) return@runOnUiThread
+                if (paragraphs.isEmpty()) {
+                    if (isAutoNext && pageIndex + 1 < totalPages && pdfBlankSkipCount < 5) {
+                        pdfBlankSkipCount++
+                        goToPage(pageIndex + 1, autoPlayTts = true)
+                    } else {
+                        val msg = if (isAutoNext) {
+                            "Dừng đọc: nhiều trang liên tiếp không có chữ (có thể là PDF ảnh scan)"
+                        } else {
+                            "Trang ${pageIndex + 1} không có chữ để đọc (hoặc là PDF ảnh scan)"
+                        }
+                        Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                        stopTtsAndHideBar()
+                    }
+                } else {
+                    pdfBlankSkipCount = 0
+                    ttsEngine?.start(paragraphs, 0)
+                }
+            }
+        }
+    }
+
+    private fun extractPdfParagraphs(raw: String): List<String> {
+        val normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
+        val lines = normalized.split("\n")
+        val out = mutableListOf<String>()
+        val buf = StringBuilder()
+
+        fun flush() {
+            val text = buf.toString().replace(Regex("\\s+"), " ").trim()
+            buf.setLength(0)
+            if (text.length < 2) return
+            if (Regex("^[-–—\\s]*\\d+[-–—\\s]*$").matches(text)) return
+            out.add(text)
+        }
+
+        for (rawLine in lines) {
+            val line = rawLine.trim()
+            if (line.isEmpty()) {
+                flush()
+                continue
+            }
+            if (buf.isNotEmpty()) {
+                val lastChar = buf[buf.length - 1]
+                if (lastChar == '-' && buf.length >= 2 && buf[buf.length - 2].isLetter() && line[0].isLetter()) {
+                    buf.deleteCharAt(buf.length - 1)
+                } else {
+                    buf.append(' ')
+                }
+            }
+            buf.append(line)
+
+            val endsSentence = line.endsWith(".") || line.endsWith("!") ||
+                line.endsWith("?") || line.endsWith(":") || line.endsWith("…")
+            if (endsSentence && buf.length >= 120) {
+                flush()
+            }
+        }
+        flush()
+        return out
     }
 
     private fun showVoicePicker() {
@@ -752,9 +891,8 @@ class ReaderActivity : AppCompatActivity() {
     private fun openPageBook() {
         applyPdfNightFilter()
         renderExecutor.execute {
-            val isPdf = bookFile.extension.equals("pdf", true)
             val count = runCatching {
-                if (isPdf) {
+                if (isPdfMode) {
                     pdfFd = ParcelFileDescriptor.open(bookFile, ParcelFileDescriptor.MODE_READ_ONLY)
                     pdfRenderer = PdfRenderer(pdfFd!!)
                     pdfRenderer!!.pageCount
@@ -780,7 +918,7 @@ class ReaderActivity : AppCompatActivity() {
         }
     }
 
-    private fun goToPage(index: Int) {
+    private fun goToPage(index: Int, autoPlayTts: Boolean = false) {
         if (totalPages <= 0) return
         if (index < 0) {
             Toast.makeText(this, "Đang ở trang đầu", Toast.LENGTH_SHORT).show()
@@ -790,6 +928,13 @@ class ReaderActivity : AppCompatActivity() {
             Toast.makeText(this, "Đã đến trang cuối", Toast.LENGTH_SHORT).show()
             return
         }
+
+        val isTtsBarOpen = ttsBar?.visibility == View.VISIBLE
+        val resumeTtsOnNewPage = !autoPlayTts && isPdfMode && ttsEngine?.isPlaying == true
+        if (!autoPlayTts && !resumeTtsOnNewPage && isPdfMode && isTtsBarOpen) {
+            stopTtsAndHideBar()
+        }
+
         currentPage = index
         pageSeekBar.progress = index
         progressText.text = "Trang ${index + 1} / $totalPages"
@@ -818,6 +963,13 @@ class ReaderActivity : AppCompatActivity() {
             runOnUiThread {
                 if (bmp != null) pageImageView.setPageBitmap(bmp)
             }
+        }
+
+        if (autoPlayTts) {
+            startPdfTtsForPage(index, isAutoNext = true)
+        } else if (resumeTtsOnNewPage) {
+            pdfBlankSkipCount = 0
+            startPdfTtsForPage(index, isAutoNext = false)
         }
     }
 
@@ -897,7 +1049,13 @@ class ReaderActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        pdfTtsRequestId.incrementAndGet()
         ttsEngine?.release()
+        pdfTextExecutor.execute {
+            runCatching { pdfTextDoc?.close() }
+            pdfTextDoc = null
+        }
+        pdfTextExecutor.shutdown()
         renderExecutor.execute {
             runCatching { pdfRenderer?.close() }
             runCatching { pdfFd?.close() }
