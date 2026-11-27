@@ -18,6 +18,7 @@ import org.json.JSONArray
 import java.io.File
 import java.util.concurrent.Executors
 import java.util.zip.ZipFile
+import kotlin.math.abs
 
 class ReaderActivity : AppCompatActivity() {
 
@@ -444,7 +445,7 @@ class ReaderActivity : AppCompatActivity() {
     private fun cycleSpeed() {
         val engine = ttsEngine ?: return
         val speeds = listOf(0.85f, 1.0f, 1.15f, 1.3f, 1.5f)
-        val curIdx = speeds.indexOfFirst { kotlin.math.abs(it - engine.speed) < 0.05f }
+        val curIdx = speeds.indexOfFirst { abs(it - engine.speed) < 0.05f }
         val nextSpeed = speeds[(curIdx + 1) % speeds.size]
         prefs.edit().putFloat("pref_tts_speed", nextSpeed).apply()
         engine.updateVoiceOrSpeed(engine.voice, nextSpeed)
@@ -860,7 +861,6 @@ class ReaderActivity : AppCompatActivity() {
 
     // ==================== PHÍM ÂM LƯỢNG ====================
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        // Khi đang nghe đọc sách thì trả phím âm lượng về tăng/giảm loa bình thường
         if (ttsEngine?.isPlaying == true) {
             return super.onKeyDown(keyCode, event)
         }
@@ -921,50 +921,99 @@ class PageImageView(
     private var currentBmp: Bitmap? = null
     private var baseScale = 1f
     private var curScale = 1f
+    private var lastScaleTime = 0L
 
-    private val scaleDetector = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
-        override fun onScale(detector: ScaleGestureDetector): Boolean {
-            val factor = detector.scaleFactor
-            val newScale = (curScale * factor).coerceIn(baseScale, baseScale * 4f)
-            val realFactor = newScale / curScale
-            curScale = newScale
-            imgMatrix.postScale(realFactor, realFactor, detector.focusX, detector.focusY)
-            imageMatrix = imgMatrix
-            return true
-        }
-    })
-
-    private val gestureDetector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
-        override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
-            when {
-                e.x < width * 0.25f -> onTapLeft()
-                e.x > width * 0.75f -> onTapRight()
-                else -> onTapCenter()
-            }
-            return true
-        }
-
-        override fun onDoubleTap(e: MotionEvent): Boolean {
-            if (curScale > baseScale * 1.15f) {
-                fitToScreen()
-            } else {
-                val factor = 2.2f
-                curScale *= factor
-                imgMatrix.postScale(factor, factor, e.x, e.y)
-                imageMatrix = imgMatrix
-            }
-            return true
-        }
-
-        override fun onScroll(e1: MotionEvent?, e2: MotionEvent, dx: Float, dy: Float): Boolean {
-            if (curScale > baseScale * 1.02f) {
-                imgMatrix.postTranslate(-dx, -dy)
+    private val scaleDetector = ScaleGestureDetector(
+        context,
+        object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                lastScaleTime = System.currentTimeMillis()
+                val factor = detector.scaleFactor
+                val newScale = (curScale * factor).coerceIn(baseScale, baseScale * 4f)
+                val realFactor = newScale / curScale
+                curScale = newScale
+                imgMatrix.postScale(realFactor, realFactor, detector.focusX, detector.focusY)
                 imageMatrix = imgMatrix
                 return true
             }
-            return false
+
+            override fun onScaleEnd(detector: ScaleGestureDetector) {
+                lastScaleTime = System.currentTimeMillis()
+            }
         }
-    })
+    )
+
+    private val gestureDetector = GestureDetector(
+        context,
+        object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: MotionEvent): Boolean = true
+
+            override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                when {
+                    e.x < width * 0.25f -> onTapLeft()
+                    e.x > width * 0.75f -> onTapRight()
+                    else -> onTapCenter()
+                }
+                return true
+            }
+
+            override fun onDoubleTap(e: MotionEvent): Boolean {
+                if (curScale > baseScale * 1.15f) {
+                    fitToScreen()
+                } else {
+                    val factor = 2.2f
+                    curScale *= factor
+                    imgMatrix.postScale(factor, factor, e.x, e.y)
+                    imageMatrix = imgMatrix
+                }
+                return true
+            }
+
+            override fun onScroll(
+                e1: MotionEvent?,
+                e2: MotionEvent,
+                dx: Float,
+                dy: Float
+            ): Boolean {
+                if (scaleDetector.isInProgress) return false
+                if (curScale > baseScale * 1.05f) {
+                    imgMatrix.postTranslate(-dx, -dy)
+                    imageMatrix = imgMatrix
+                    return true
+                }
+                return false
+            }
+
+            override fun onFling(
+                e1: MotionEvent?,
+                e2: MotionEvent,
+                velocityX: Float,
+                velocityY: Float
+            ): Boolean {
+                if (e1 == null || scaleDetector.isInProgress) return false
+                if (System.currentTimeMillis() - lastScaleTime < 250L) return false
+                if (curScale > baseScale * 1.05f) return false
+
+                val dx = e2.x - e1.x
+                val dy = e2.y - e1.y
+                val minDistance = 100f
+                val minVelocity = 120f
+
+                if (abs(dx) > abs(dy)) {
+                    if (abs(dx) > minDistance && abs(velocityX) > minVelocity) {
+                        if (dx < 0) onTapRight() else onTapLeft()
+                        return true
+                    }
+                } else {
+                    if (abs(dy) > minDistance && abs(velocityY) > minVelocity) {
+                        if (dy < 0) onTapRight() else onTapLeft()
+                        return true
+                    }
+                }
+                return false
+            }
+        }
+    )
 
     init {
         scaleType = ScaleType.MATRIX
@@ -1005,3 +1054,4 @@ class PageImageView(
         return true
     }
 }
+// END ReaderActivity
