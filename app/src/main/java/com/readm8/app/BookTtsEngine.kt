@@ -10,9 +10,11 @@ import android.os.PowerManager
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.text.TextUtils
+import okhttp3.ConnectionSpec
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.TlsVersion
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
@@ -54,7 +56,10 @@ data class TtsSegment(
 
 private object EdgeTtsDrm {
     const val TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
-    const val CHROMIUM_FULL_VERSION = "143.0.3650.75"
+    const val CHROMIUM_FULL_VERSION = "155.0.4283.45"
+    const val SEC_MS_GEC_VERSION = "2-$CHROMIUM_FULL_VERSION"
+    const val USER_AGENT =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36 Edg/155.0.0.0"
     private const val WIN_EPOCH = 11644473600L
 
     private val SHA256_INITIAL = intArrayOf(
@@ -475,11 +480,19 @@ class BookTtsEngine(
     private val onFallbackNotice: (msg: String) -> Unit
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val fetchExecutor: ExecutorService = Executors.newFixedThreadPool(3)
+    private val fetchExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val waitExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+
+    private val tls12Spec = ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
+        .tlsVersions(TlsVersion.TLS_1_2)
+        .build()
+
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
+        .connectionSpecs(listOf(tls12Spec, ConnectionSpec.MODERN_TLS))
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(25, TimeUnit.SECONDS)
+        .pingInterval(15, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
         .build()
 
     private val ttsCacheDir = File(context.cacheDir, "tts_audio").apply { mkdirs() }
@@ -497,7 +510,7 @@ class BookTtsEngine(
     private var fallbackNoticeShown = false
 
     @Volatile
-    private var gecVersionPrefix: String = "1-"
+    private var useNewEndpoint: Boolean = true
 
     @Volatile
     private var lastErrorReason: String = ""
@@ -771,10 +784,9 @@ class BookTtsEngine(
 
         val currentFuture = ensurePrefetch(session, index)
         if (index + 1 < segments.size) ensurePrefetch(session, index + 1)
-        if (index + 2 < segments.size) ensurePrefetch(session, index + 2)
 
         waitExecutor.execute {
-            val file = runCatching { currentFuture.get(20, TimeUnit.SECONDS) }.getOrNull()
+            val file = runCatching { currentFuture.get(25, TimeUnit.SECONDS) }.getOrNull()
             mainHandler.post {
                 if (session != sessionCounter.get() || !isPlaying) return@post
                 if (file != null && file.exists() && file.length() > 100) {
@@ -865,6 +877,24 @@ class BookTtsEngine(
         tts.speak(text, TextToSpeech.QUEUE_FLUSH, params, uid)
     }
 
+    private fun buildWsUrl(useNew: Boolean, gec: String, connId: String): String {
+        val token = EdgeTtsDrm.TRUSTED_CLIENT_TOKEN
+        val version = EdgeTtsDrm.SEC_MS_GEC_VERSION
+        return if (useNew) {
+            "wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1" +
+                "?Ocp-Apim-Subscription-Key=$token" +
+                "&Sec-MS-GEC=$gec" +
+                "&Sec-MS-GEC-Version=$version" +
+                "&ConnectionId=$connId"
+        } else {
+            "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1" +
+                "?TrustedClientToken=$token" +
+                "&Sec-MS-GEC=$gec" +
+                "&Sec-MS-GEC-Version=$version" +
+                "&ConnectionId=$connId"
+        }
+    }
+
     private fun synthesizeEdgeTts(
         session: Int,
         index: Int,
@@ -889,20 +919,16 @@ class BookTtsEngine(
             .put("context", JSONObject().put("synthesis", JSONObject().put("audio", audioJson)))
             .toString()
 
-        var flippedPrefix = false
+        var switchedEndpoint = false
+        var retriedNetwork = false
 
-        for (attempt in 0 until 3) {
+        for (attempt in 0 until 4) {
             if (session != sessionCounter.get()) return null
 
             val gec = EdgeTtsDrm.generateSecMsGecV2()
             val connId = UUID.randomUUID().toString().replace("-", "")
             val muid = UUID.randomUUID().toString().replace("-", "").uppercase(Locale.US)
-            val version = "${gecVersionPrefix}${EdgeTtsDrm.CHROMIUM_FULL_VERSION}"
-            val url = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1" +
-                "?TrustedClientToken=${EdgeTtsDrm.TRUSTED_CLIENT_TOKEN}" +
-                "&Sec-MS-GEC=$gec" +
-                "&Sec-MS-GEC-Version=$version" +
-                "&ConnectionId=$connId"
+            val url = buildWsUrl(useNewEndpoint, gec, connId)
 
             val request = Request.Builder()
                 .url(url)
@@ -911,10 +937,7 @@ class BookTtsEngine(
                 .header("Accept-Language", "en-US,en;q=0.9")
                 .header("Origin", "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold")
                 .header("Cookie", "muid=$muid;")
-                .header(
-                    "User-Agent",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0"
-                )
+                .header("User-Agent", EdgeTtsDrm.USER_AGENT)
                 .build()
 
             val audioOut = ByteArrayOutputStream(32768)
@@ -922,6 +945,7 @@ class BookTtsEngine(
             val completed = AtomicBoolean(false)
             val failedHttpCode = AtomicInteger(0)
             val failedServerDate = AtomicReference<String?>(null)
+            val failedNetwork = AtomicBoolean(false)
 
             val ts = utcTimestamp()
             val reqId = UUID.randomUUID().toString().replace("-", "")
@@ -971,7 +995,14 @@ class BookTtsEngine(
                         failedServerDate.set(response.header("Date"))
                         lastErrorReason = "HTTP ${response.code}"
                     } else {
-                        lastErrorReason = t.javaClass.simpleName
+                        failedNetwork.set(true)
+                        val root = t.cause ?: t
+                        val detail = root.message?.replace("\n", " ")?.take(52).orEmpty()
+                        lastErrorReason = if (detail.isNotEmpty()) {
+                            "${root.javaClass.simpleName}: $detail"
+                        } else {
+                            root.javaClass.simpleName
+                        }
                     }
                     latch.countDown()
                 }
@@ -981,7 +1012,7 @@ class BookTtsEngine(
                 }
             })
 
-            val finishedInTime = latch.await(15, TimeUnit.SECONDS)
+            val finishedInTime = latch.await(18, TimeUnit.SECONDS)
             if (!finishedInTime) {
                 lastErrorReason = "Timeout"
                 ws.cancel()
@@ -1000,9 +1031,21 @@ class BookTtsEngine(
                 if (serverDate != null && EdgeTtsDrm.adjustClockSkewIfNeeded(serverDate)) {
                     continue
                 }
-                if (!flippedPrefix) {
-                    gecVersionPrefix = if (gecVersionPrefix == "1-") "2-" else "1-"
-                    flippedPrefix = true
+                if (!switchedEndpoint) {
+                    useNewEndpoint = !useNewEndpoint
+                    switchedEndpoint = true
+                    continue
+                }
+            } else if (failedNetwork.get()) {
+                if (!switchedEndpoint) {
+                    useNewEndpoint = !useNewEndpoint
+                    switchedEndpoint = true
+                    runCatching { Thread.sleep(250) }
+                    continue
+                }
+                if (!retriedNetwork) {
+                    retriedNetwork = true
+                    runCatching { Thread.sleep(350) }
                     continue
                 }
             }
