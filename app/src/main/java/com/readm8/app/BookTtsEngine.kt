@@ -19,7 +19,6 @@ import okio.ByteString
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
-import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -34,6 +33,8 @@ import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.abs
 
 enum class VoiceOption(
     val label: String,
@@ -51,6 +52,421 @@ data class TtsSegment(
     val text: String
 )
 
+private object EdgeTtsDrm {
+    const val TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
+    const val CHROMIUM_FULL_VERSION = "143.0.3650.75"
+    private const val WIN_EPOCH = 11644473600L
+
+    private val SHA256_INITIAL = intArrayOf(
+        0x6A09E667,
+        0xBB67AE85.toInt(),
+        0x3C6EF372,
+        0xA54FF53A.toInt(),
+        0x510E527F,
+        0x9B05688C.toInt(),
+        0x1F83D9AB,
+        0x5BE0CD19
+    )
+
+    private val SHA256_STATE = intArrayOf(
+        0xFD9FBEA2.toInt(),
+        0x91243CE7.toInt(),
+        0xBE499094.toInt(),
+        0xCD2E1E0A.toInt(),
+        0x6C006F49,
+        0x04BD35AB,
+        0xFEB0A7E4.toInt(),
+        0x03EFFBD2
+    )
+
+    private val SHA256_SCHEDULE = intArrayOf(
+        0xEB24BF9E.toInt(),
+        0x1558691F,
+        0xA0C09EE2.toInt(),
+        0x0CFA32BA,
+        0xA622EE8C.toInt(),
+        0xD1DD9491.toInt(),
+        0xC0DD25A0.toInt(),
+        0xF9E70AB6.toInt(),
+        0xF0C31573.toInt(),
+        0x7058CE4E,
+        0x7188E606,
+        0x00E5AB33,
+        0xD258B060.toInt(),
+        0x72766564
+    )
+
+    private val SHA256_ROUND_CONSTANTS = intArrayOf(
+        0x428A2F98, 0x71374491, 0xB5C0FBCF.toInt(), 0xE9B5DBA5.toInt(),
+        0x3956C25B, 0x59F111F1, 0x923F82A4.toInt(), 0xAB1C5ED5.toInt(),
+        0xD807AA98.toInt(), 0x12835B01, 0x243185BE, 0x550C7DC3,
+        0x72BE5D74, 0x80DEB1FE.toInt(), 0x9BDC06A7.toInt(), 0xC19BF174.toInt(),
+        0xE49B69C1.toInt(), 0xEFBE4786.toInt(), 0x0FC19DC6, 0x240CA1CC,
+        0x2DE92C6F, 0x4A7484AA, 0x5CB0A9DC, 0x76F988DA,
+        0x983E5152.toInt(), 0xA831C66D.toInt(), 0xB00327C8.toInt(), 0xBF597FC7.toInt(),
+        0xC6E00BF3.toInt(), 0xD5A79147.toInt(), 0x06CA6351, 0x14292967,
+        0x27B70A85, 0x2E1B2138, 0x4D2C6DFC, 0x53380D13,
+        0x650A7354, 0x766A0ABB, 0x81C2C92E.toInt(), 0x92722C85.toInt(),
+        0xA2BFE8A1.toInt(), 0xA81A664B.toInt(), 0xC24B8B70.toInt(), 0xC76C51A3.toInt(),
+        0xD192E819.toInt(), 0xD6990624.toInt(), 0xF40E3585.toInt(), 0x106AA070,
+        0x19A4C116, 0x1E376C08, 0x2748774C, 0x34B0BCB5,
+        0x391C0CB3, 0x4ED8AA4A, 0x5B9CCA4F, 0x682E6FF3,
+        0x748F82EE, 0x78A5636F, 0x84C87814.toInt(), 0x8CC70208.toInt(),
+        0x90BEFFFA.toInt(), 0xA4506CEB.toInt(), 0xBEF9A3F7.toInt(), 0xC67178F2.toInt()
+    )
+
+    private val SHA256_ADJUSTMENT = 0xC9DC06A7.toInt()
+    private val SHA256_BLOCK_CONSTANTS = SHA256_ROUND_CONSTANTS.copyOf().apply {
+        this[14] = SHA256_ADJUSTMENT
+    }
+    private const val SHA256_SIGMA0_ADJUSTMENT = 0x059C0B80
+    private const val SHA256_SIGMA1_ADJUSTMENT = 0x000B92C0
+
+    private val CS64_COEFF_A = intArrayOf(
+        0xE82E91B1.toInt(),
+        0x44DE24C6,
+        0x3BEB65BC,
+        0xC89C5933.toInt(),
+        0x8D1EC211.toInt(),
+        0x314EF5D5,
+        0xE92491B1.toInt(),
+        0xF0A5B9D5.toInt(),
+        0x06064CF3,
+        0xDA79FA60.toInt(),
+        0xBED20560.toInt(),
+        0x89F9C9F8.toInt(),
+        0x35FA38C6,
+        0xCB49E3C6.toInt()
+    )
+
+    private val CS64_COEFF_B = intArrayOf(
+        0xB32700D0.toInt(),
+        0x88DFF51D.toInt(),
+        0x29514038,
+        0xB328CBDF.toInt(),
+        0xD405B4D5.toInt(),
+        0x26E55F3C,
+        0x607801C6,
+        0x82B2C1FB.toInt(),
+        0xFA51A3DA.toInt(),
+        0x207CC464,
+        0x3C3C74F3,
+        0xD2D14B61.toInt(),
+        0xBB04A2C1.toInt(),
+        0xC5626167.toInt()
+    )
+
+    private val CS64_FACTOR = 0x82893933.toInt()
+    private val CS64_ADJUSTMENT0 = 0xF2F90B1A.toInt()
+    private const val CS64_ADJUSTMENT1 = 0x0B1A0000
+
+    @Volatile
+    private var clockSkewSeconds: Long = 0L
+
+    @Volatile
+    private var cachedTicks: Long = -1L
+
+    @Volatile
+    private var cachedToken: String = ""
+
+    fun adjustClockSkewIfNeeded(serverDateHeader: String): Boolean {
+        val serverSec = parseRfc2616Date(serverDateHeader) ?: return false
+        val clientSec = (System.currentTimeMillis() / 1000L) + clockSkewSeconds
+        val diff = serverSec - clientSec
+        if (abs(diff) < 5L) return false
+        clockSkewSeconds += diff
+        cachedTicks = -1L
+        return true
+    }
+
+    private fun parseRfc2616Date(dateStr: String): Long? {
+        return runCatching {
+            val sdf = SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", Locale.US)
+            sdf.timeZone = TimeZone.getTimeZone("UTC")
+            val parsed = sdf.parse(dateStr.trim()) ?: return null
+            parsed.time / 1000L
+        }.getOrNull()
+    }
+
+    fun generateSecMsGecV2(): String {
+        val unixSec = (System.currentTimeMillis() / 1000L) + clockSkewSeconds
+        var ticks = unixSec + WIN_EPOCH
+        ticks -= ((ticks % 300L) + 300L) % 300L
+        val ticks100ns = ticks * 10_000_000L
+
+        if (ticks100ns == cachedTicks && cachedToken.isNotEmpty()) {
+            return cachedToken
+        }
+
+        val data = "$ticks100ns$TRUSTED_CLIENT_TOKEN".toByteArray(Charsets.US_ASCII)
+        val sha256Bytes = sha256Digest(data)
+        val cs64Bytes = cs64DigestBytes(data, sha256Bytes)
+        val token = "${toUpperHex(cs64Bytes)}-${toUpperHex(sha256Bytes)}"
+        cachedTicks = ticks100ns
+        cachedToken = token
+        return token
+    }
+
+    private fun rol16(value: Int): Int = Integer.rotateLeft(value, 16)
+
+    private fun sigma0(value: Int): Int {
+        return Integer.rotateRight(value, 7) xor
+            Integer.rotateRight(value, 18) xor
+            (value ushr 3)
+    }
+
+    private fun sigma1(value: Int): Int {
+        return Integer.rotateRight(value, 17) xor
+            Integer.rotateRight(value, 19) xor
+            (value ushr 10)
+    }
+
+    private fun expandSha256Schedule(words: IntArray, firstWord: Int = 16) {
+        for (index in firstWord until 64) {
+            words[index] = sigma1(words[index - 2]) +
+                words[index - 7] +
+                sigma0(words[index - 15]) +
+                words[index - 16]
+        }
+    }
+
+    private fun sha256Rounds(state: IntArray, words: IntArray, firstRound: Int = 0): IntArray {
+        var a = state[0]
+        var b = state[1]
+        var c = state[2]
+        var d = state[3]
+        var e = state[4]
+        var f = state[5]
+        var g = state[6]
+        var h = state[7]
+        val constants = if (firstRound == 14) SHA256_BLOCK_CONSTANTS else SHA256_ROUND_CONSTANTS
+
+        for (index in firstRound until 64) {
+            val s1 = Integer.rotateRight(e, 6) xor
+                Integer.rotateRight(e, 11) xor
+                Integer.rotateRight(e, 25)
+            val ch = g xor (e and (f xor g))
+            val t1 = h + s1 + ch + constants[index] + words[index]
+            val s0 = Integer.rotateRight(a, 2) xor
+                Integer.rotateRight(a, 13) xor
+                Integer.rotateRight(a, 22)
+            val maj = (a and b) or (c and (a or b))
+            val t2 = s0 + maj
+
+            h = g
+            g = f
+            f = e
+            e = d + t1
+            d = c
+            c = b
+            b = a
+            a = t1 + t2
+        }
+        return intArrayOf(a, b, c, d, e, f, g, h)
+    }
+
+    private fun sha256Init(data: ByteArray): IntArray {
+        val words = IntArray(64)
+        words[14] = ((data[0].toInt() and 0xFF) shl 16) or
+            ((data[1].toInt() and 0xFF) shl 8) or
+            (data[2].toInt() and 0xFF)
+        words[15] = ((data[3].toInt() and 0xFF) shl 24) or
+            ((data[4].toInt() and 0xFF) shl 16) or
+            ((data[5].toInt() and 0xFF) shl 8) or
+            (data[6].toInt() and 0xFF)
+
+        for (index in 16 until 30) {
+            var value = SHA256_SCHEDULE[index - 16]
+            if (index - 2 >= 14) {
+                value += if (index == 16) {
+                    sigma1(words[index - 2]) xor SHA256_SIGMA1_ADJUSTMENT
+                } else {
+                    sigma1(words[index - 2])
+                }
+            }
+            if (index - 7 >= 14) {
+                value += words[index - 7]
+            }
+            if (index - 15 >= 14) {
+                value += if (index == 29) {
+                    sigma0(words[index - 15]) xor SHA256_SIGMA0_ADJUSTMENT
+                } else {
+                    sigma0(words[index - 15])
+                }
+            }
+            words[index] = value
+        }
+
+        words[30] = sigma1(words[28]) +
+            words[23] +
+            sigma0(words[15]) +
+            words[14] +
+            SHA256_ADJUSTMENT -
+            SHA256_ROUND_CONSTANTS[14]
+
+        expandSha256Schedule(words, 31)
+        val working = sha256Rounds(SHA256_STATE, words, 14)
+        return IntArray(8) { i -> SHA256_INITIAL[i] + working[i] }
+    }
+
+    private fun sha256Digest(data: ByteArray): ByteArray {
+        val length = 57 + data.size
+        val zeroPadLen = ((55 - length) % 64 + 64) % 64
+        val bitLen = length.toLong() * 8L
+
+        val out = ByteArrayOutputStream(data.size + 72)
+        out.write(data, 7, data.size - 7)
+        out.write(0x80)
+        repeat(zeroPadLen) { out.write(0) }
+        for (shift in 56 downTo 0 step 8) {
+            out.write(((bitLen ushr shift) and 0xFFL).toInt())
+        }
+        val padded = out.toByteArray()
+
+        var state = sha256Init(data)
+        val words = IntArray(64)
+        var offset = 0
+        while (offset < padded.size) {
+            for (i in 0 until 16) {
+                val p = offset + i * 4
+                words[i] = ((padded[p].toInt() and 0xFF) shl 24) or
+                    ((padded[p + 1].toInt() and 0xFF) shl 16) or
+                    ((padded[p + 2].toInt() and 0xFF) shl 8) or
+                    (padded[p + 3].toInt() and 0xFF)
+            }
+            expandSha256Schedule(words, 16)
+            val working = sha256Rounds(state, words, 0)
+            state = IntArray(8) { i -> state[i] + working[i] }
+            offset += 64
+        }
+
+        val digest = ByteArray(32)
+        for (i in 0 until 8) {
+            val w = state[i]
+            digest[i * 4] = ((w ushr 24) and 0xFF).toByte()
+            digest[i * 4 + 1] = ((w ushr 16) and 0xFF).toByte()
+            digest[i * 4 + 2] = ((w ushr 8) and 0xFF).toByte()
+            digest[i * 4 + 3] = (w and 0xFF).toByte()
+        }
+        return digest
+    }
+
+    private fun wordsLe4Even(data: ByteArray): IntArray {
+        if (data.isEmpty()) return IntArray(0)
+        val wordCount = (data.size + 3) / 4
+        val evenCount = if (wordCount % 2 == 1) wordCount + 1 else wordCount
+        val words = IntArray(evenCount)
+        for (i in 0 until wordCount) {
+            val base = i * 4
+            val b0 = if (base < data.size) (data[base].toInt() and 0xFF) else 0
+            val b1 = if (base + 1 < data.size) (data[base + 1].toInt() and 0xFF) else 0
+            val b2 = if (base + 2 < data.size) (data[base + 2].toInt() and 0xFF) else 0
+            val b3 = if (base + 3 < data.size) (data[base + 3].toInt() and 0xFF) else 0
+            words[i] = b0 or (b1 shl 8) or (b2 shl 16) or (b3 shl 24)
+        }
+        return words
+    }
+
+    private fun cs64DigestBytes(data: ByteArray, digest: ByteArray): ByteArray {
+        val keyA = ((digest[0].toInt() and 0xFF) or
+            ((digest[1].toInt() and 0xFF) shl 8) or
+            ((digest[2].toInt() and 0xFF) shl 16) or
+            ((digest[3].toInt() and 0xFF) shl 24)) or 1
+        val keyB = ((digest[4].toInt() and 0xFF) or
+            ((digest[5].toInt() and 0xFF) shl 8) or
+            ((digest[6].toInt() and 0xFF) shl 16) or
+            ((digest[7].toInt() and 0xFF) shl 24)) or 1
+
+        val factor0 = keyA * CS64_FACTOR
+        val factor1 = keyB * CS64_FACTOR
+
+        val prefixed = ByteArray(data.size + 1)
+        prefixed[0] = 0
+        System.arraycopy(data, 0, prefixed, 1, data.size)
+        val dataWords = wordsLe4Even(prefixed)
+
+        val baseLen = CS64_COEFF_A.size
+        val terms = IntArray(baseLen + dataWords.size)
+        val offsets = IntArray(baseLen + dataWords.size)
+
+        for (i in 0 until baseLen) {
+            terms[i] = CS64_COEFF_A[i] * if (i % 2 == 0) factor0 else factor1
+            offsets[i] = CS64_COEFF_B[i]
+        }
+
+        for (i in dataWords.indices) {
+            val word = dataWords[i]
+            var term = word * if (i % 2 == 0) keyA else keyB
+            var offset = rol16(word) * if (i % 2 == 0) 0xEF0569FB.toInt() else 0xC31713DB.toInt()
+            if (i == 0) {
+                term += CS64_ADJUSTMENT0 * factor0
+                offset += CS64_ADJUSTMENT1
+            }
+            terms[baseLen + i] = term
+            offsets[baseLen + i] = offset
+        }
+
+        var swapAcc = 0
+        var swapLast = 0
+        var state = 0
+        var acc = 0
+
+        var index = 0
+        while (index < terms.size) {
+            val x = terms[index]
+            val y = terms[index + 1]
+
+            var t = rol16(offsets[index] + x)
+            var q = t * 0x76F50F34
+            swapAcc += rol16(q) * 0xC3EFEA97.toInt() + q
+
+            t = rol16(offsets[index + 1] + y)
+            q = t * 0x1881CE3C
+            swapLast = rol16(q) * 0x35BD1EC9 + q
+            swapAcc += swapLast
+
+            state = state * keyA + x
+            state = rol16(state) * 0xCF98B111.toInt()
+            state = rol16(state) * 0x87085B9F.toInt()
+            state = rol16(state) * 0x12CEB96D
+            state = rol16(state) * 0x257E1D83
+            acc += state
+
+            t = state * keyB + y
+            t = rol16(t) * 0xA27416F5.toInt()
+            t = rol16(t) * 0xD38396FF.toInt()
+            state = rol16(rol16(t) * 0x7C932B89) * 0xBFA49F69.toInt()
+            acc += state
+
+            index += 2
+        }
+
+        val w0 = swapLast xor state
+        val w1 = swapAcc xor acc
+        return byteArrayOf(
+            (w0 and 0xFF).toByte(),
+            ((w0 ushr 8) and 0xFF).toByte(),
+            ((w0 ushr 16) and 0xFF).toByte(),
+            ((w0 ushr 24) and 0xFF).toByte(),
+            (w1 and 0xFF).toByte(),
+            ((w1 ushr 8) and 0xFF).toByte(),
+            ((w1 ushr 16) and 0xFF).toByte(),
+            ((w1 ushr 24) and 0xFF).toByte()
+        )
+    }
+
+    private fun toUpperHex(bytes: ByteArray): String {
+        val chars = "0123456789ABCDEF"
+        val sb = StringBuilder(bytes.size * 2)
+        for (b in bytes) {
+            val v = b.toInt() and 0xFF
+            sb.append(chars[v ushr 4])
+            sb.append(chars[v and 0x0F])
+        }
+        return sb.toString()
+    }
+}
+
 class BookTtsEngine(
     private val context: Context,
     private val onSegmentActive: (domIndex: Int, segIndex: Int, totalSegments: Int) -> Unit,
@@ -59,7 +475,8 @@ class BookTtsEngine(
     private val onFallbackNotice: (msg: String) -> Unit
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val fetchExecutor: ExecutorService = Executors.newFixedThreadPool(2)
+    private val fetchExecutor: ExecutorService = Executors.newFixedThreadPool(3)
+    private val waitExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
         .readTimeout(20, TimeUnit.SECONDS)
@@ -78,6 +495,12 @@ class BookTtsEngine(
     private var segments: List<TtsSegment> = emptyList()
     private var currentSegIndex = 0
     private var fallbackNoticeShown = false
+
+    @Volatile
+    private var gecVersionPrefix: String = "1-"
+
+    @Volatile
+    private var lastErrorReason: String = ""
 
     @Volatile
     var isActive = false
@@ -205,6 +628,7 @@ class BookTtsEngine(
         isActive = true
         isPlaying = true
         fallbackNoticeShown = false
+        lastErrorReason = ""
         acquireWakeLock()
 
         val session = sessionCounter.incrementAndGet()
@@ -261,6 +685,7 @@ class BookTtsEngine(
         voice = newVoice
         speed = newSpeed
         fallbackNoticeShown = false
+        lastErrorReason = ""
         if (isActive && isPlaying) {
             jumpToSegment(currentSegIndex)
         }
@@ -289,6 +714,7 @@ class BookTtsEngine(
         stopInternal(clearState = true)
         sleepRunnable?.let { mainHandler.removeCallbacks(it) }
         fetchExecutor.shutdownNow()
+        waitExecutor.shutdownNow()
         runCatching { offlineTts?.shutdown() }
         offlineTts = null
         cleanCacheFiles()
@@ -347,8 +773,8 @@ class BookTtsEngine(
         if (index + 1 < segments.size) ensurePrefetch(session, index + 1)
         if (index + 2 < segments.size) ensurePrefetch(session, index + 2)
 
-        fetchExecutor.execute {
-            val file = runCatching { currentFuture.get(18, TimeUnit.SECONDS) }.getOrNull()
+        waitExecutor.execute {
+            val file = runCatching { currentFuture.get(20, TimeUnit.SECONDS) }.getOrNull()
             mainHandler.post {
                 if (session != sessionCounter.get() || !isPlaying) return@post
                 if (file != null && file.exists() && file.length() > 100) {
@@ -356,7 +782,8 @@ class BookTtsEngine(
                 } else {
                     if (!fallbackNoticeShown) {
                         fallbackNoticeShown = true
-                        onFallbackNotice("Giọng AI tạm gián đoạn, chuyển sang giọng Offline")
+                        val detail = if (lastErrorReason.isNotEmpty()) " ($lastErrorReason)" else ""
+                        onFallbackNotice("Giọng AI gián đoạn$detail, chuyển sang Offline")
                     }
                     playOffline(session, index, seg.text)
                 }
@@ -449,34 +876,8 @@ class BookTtsEngine(
         val cleanText = escapeXml(text)
         if (cleanText.isBlank()) return null
 
-        val trustedToken = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
-        val gec = generateSecMsGec(trustedToken)
-        val connId = UUID.randomUUID().toString().replace("-", "")
-        val url = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1" +
-            "?TrustedClientToken=$trustedToken" +
-            "&Sec-MS-GEC=$gec" +
-            "&Sec-MS-GEC-Version=1-130.0.2849.68" +
-            "&ConnectionId=$connId"
-
-        val request = Request.Builder()
-            .url(url)
-            .header("Pragma", "no-cache")
-            .header("Cache-Control", "no-cache")
-            .header("Origin", "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold")
-            .header(
-                "User-Agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"
-            )
-            .build()
-
-        val audioOut = ByteArrayOutputStream(32768)
-        val latch = CountDownLatch(1)
-        val completed = AtomicBoolean(false)
-
         val pct = ((rateMultiplier - 1.0f) * 100f).toInt().coerceIn(-50, 100)
         val rateStr = if (pct >= 0) "+$pct%" else "$pct%"
-        val ts = utcTimestamp()
-        val reqId = UUID.randomUUID().toString().replace("-", "")
 
         val metaJson = JSONObject()
             .put("sentenceBoundaryEnabled", "false")
@@ -488,76 +889,126 @@ class BookTtsEngine(
             .put("context", JSONObject().put("synthesis", JSONObject().put("audio", audioJson)))
             .toString()
 
-        val ws = httpClient.newWebSocket(request, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                val configMsg = "X-Timestamp:$ts\r\n" +
-                    "Content-Type:application/json; charset=utf-8\r\n" +
-                    "Path:speech.config\r\n\r\n" +
-                    cfgBody
-                webSocket.send(configMsg)
+        var flippedPrefix = false
 
-                val ssmlMsg = "X-RequestId:$reqId\r\n" +
-                    "Content-Type:application/ssml+xml\r\n" +
-                    "X-Timestamp:${ts}Z\r\n" +
-                    "Path:ssml\r\n\r\n" +
-                    "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='vi-VN'>" +
-                    "<voice name='$voiceName'><prosody pitch='+0Hz' rate='$rateStr' volume='+0%'>$cleanText</prosody></voice>" +
-                    "</speak>"
-                webSocket.send(ssmlMsg)
-            }
+        for (attempt in 0 until 3) {
+            if (session != sessionCounter.get()) return null
 
-            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                val arr = bytes.toByteArray()
-                if (arr.size < 2) return
-                val headerLen = ((arr[0].toInt() and 0xFF) shl 8) or (arr[1].toInt() and 0xFF)
-                val audioStart = 2 + headerLen
-                if (audioStart < arr.size) {
-                    val header = String(arr, 2, headerLen, Charsets.UTF_8)
-                    if (header.contains("Path:audio")) {
-                        audioOut.write(arr, audioStart, arr.size - audioStart)
+            val gec = EdgeTtsDrm.generateSecMsGecV2()
+            val connId = UUID.randomUUID().toString().replace("-", "")
+            val muid = UUID.randomUUID().toString().replace("-", "").uppercase(Locale.US)
+            val version = "${gecVersionPrefix}${EdgeTtsDrm.CHROMIUM_FULL_VERSION}"
+            val url = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1" +
+                "?TrustedClientToken=${EdgeTtsDrm.TRUSTED_CLIENT_TOKEN}" +
+                "&Sec-MS-GEC=$gec" +
+                "&Sec-MS-GEC-Version=$version" +
+                "&ConnectionId=$connId"
+
+            val request = Request.Builder()
+                .url(url)
+                .header("Pragma", "no-cache")
+                .header("Cache-Control", "no-cache")
+                .header("Accept-Language", "en-US,en;q=0.9")
+                .header("Origin", "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold")
+                .header("Cookie", "muid=$muid;")
+                .header(
+                    "User-Agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0"
+                )
+                .build()
+
+            val audioOut = ByteArrayOutputStream(32768)
+            val latch = CountDownLatch(1)
+            val completed = AtomicBoolean(false)
+            val failedHttpCode = AtomicInteger(0)
+            val failedServerDate = AtomicReference<String?>(null)
+
+            val ts = utcTimestamp()
+            val reqId = UUID.randomUUID().toString().replace("-", "")
+
+            val ws = httpClient.newWebSocket(request, object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    val configMsg = "X-Timestamp:$ts\r\n" +
+                        "Content-Type:application/json; charset=utf-8\r\n" +
+                        "Path:speech.config\r\n\r\n" +
+                        cfgBody
+                    webSocket.send(configMsg)
+
+                    val ssmlMsg = "X-RequestId:$reqId\r\n" +
+                        "Content-Type:application/ssml+xml\r\n" +
+                        "X-Timestamp:${ts}Z\r\n" +
+                        "Path:ssml\r\n\r\n" +
+                        "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='vi-VN'>" +
+                        "<voice name='$voiceName'><prosody pitch='+0Hz' rate='$rateStr' volume='+0%'>$cleanText</prosody></voice>" +
+                        "</speak>"
+                    webSocket.send(ssmlMsg)
+                }
+
+                override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                    val arr = bytes.toByteArray()
+                    if (arr.size < 2) return
+                    val headerLen = ((arr[0].toInt() and 0xFF) shl 8) or (arr[1].toInt() and 0xFF)
+                    val audioStart = 2 + headerLen
+                    if (audioStart < arr.size) {
+                        val header = String(arr, 2, headerLen, Charsets.UTF_8)
+                        if (header.contains("Path:audio")) {
+                            audioOut.write(arr, audioStart, arr.size - audioStart)
+                        }
                     }
                 }
-            }
 
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                if (text.contains("Path:turn.end")) {
-                    completed.set(true)
-                    webSocket.close(1000, "done")
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    if (text.contains("Path:turn.end")) {
+                        completed.set(true)
+                        webSocket.close(1000, "done")
+                        latch.countDown()
+                    }
+                }
+
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    if (response != null) {
+                        failedHttpCode.set(response.code)
+                        failedServerDate.set(response.header("Date"))
+                        lastErrorReason = "HTTP ${response.code}"
+                    } else {
+                        lastErrorReason = t.javaClass.simpleName
+                    }
                     latch.countDown()
                 }
+
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                    latch.countDown()
+                }
+            })
+
+            val finishedInTime = latch.await(15, TimeUnit.SECONDS)
+            if (!finishedInTime) {
+                lastErrorReason = "Timeout"
+                ws.cancel()
             }
 
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                latch.countDown()
+            if (completed.get() && audioOut.size() >= 100 && session == sessionCounter.get()) {
+                val outFile = File(ttsCacheDir, "tts_${session}_${index}.mp3")
+                return runCatching {
+                    outFile.writeBytes(audioOut.toByteArray())
+                    outFile
+                }.getOrNull()
             }
 
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                latch.countDown()
+            if (failedHttpCode.get() == 403) {
+                val serverDate = failedServerDate.get()
+                if (serverDate != null && EdgeTtsDrm.adjustClockSkewIfNeeded(serverDate)) {
+                    continue
+                }
+                if (!flippedPrefix) {
+                    gecVersionPrefix = if (gecVersionPrefix == "1-") "2-" else "1-"
+                    flippedPrefix = true
+                    continue
+                }
             }
-        })
-
-        val finishedInTime = latch.await(15, TimeUnit.SECONDS)
-        if (!finishedInTime) ws.cancel()
-
-        if (!completed.get() || audioOut.size() < 100 || session != sessionCounter.get()) {
-            return null
+            break
         }
-
-        val outFile = File(ttsCacheDir, "tts_${session}_${index}.mp3")
-        return runCatching {
-            outFile.writeBytes(audioOut.toByteArray())
-            outFile
-        }.getOrNull()
-    }
-
-    private fun generateSecMsGec(token: String): String {
-        val winEpoch = 11644473600L
-        var ticks = (System.currentTimeMillis() / 1000L) + winEpoch
-        ticks -= (ticks % 300L)
-        val ticks100ns = ticks * 10_000_000L
-        val raw = "$ticks100ns$token"
-        val digest = MessageDigest.getInstance("SHA-256").digest(raw.toByteArray(Charsets.US_ASCII))
-        return digest.joinToString("") { "%02X".format(it) }
+        return null
     }
 
     private fun utcTimestamp(): String {
