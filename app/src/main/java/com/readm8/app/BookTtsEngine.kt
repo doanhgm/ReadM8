@@ -3,6 +3,7 @@ package com.readm8.app
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.MediaPlayer
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -21,6 +22,7 @@ import okio.ByteString
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.net.NetworkInterface
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -489,20 +491,23 @@ class BookTtsEngine(
 
     private val httpClient = OkHttpClient.Builder()
         .connectionSpecs(listOf(tls12Spec, ConnectionSpec.MODERN_TLS))
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(25, TimeUnit.SECONDS)
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
         .pingInterval(15, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
         .build()
 
     private val ttsCacheDir = File(context.cacheDir, "tts_audio").apply { mkdirs() }
     private val sessionCounter = AtomicInteger(0)
+    private val offlineConsecutiveErrors = AtomicInteger(0)
+    private val activeWebSocket = AtomicReference<WebSocket?>(null)
     private val playerLock = Any()
     private val prefetchMap = ConcurrentHashMap<Int, Future<File?>>()
 
     private var mediaPlayer: MediaPlayer? = null
     private var offlineTts: TextToSpeech? = null
     private var offlineReady = false
+    private var offlineLocalVoicePicked = false
     private var wakeLock: PowerManager.WakeLock? = null
 
     private var segments: List<TtsSegment> = emptyList()
@@ -514,6 +519,12 @@ class BookTtsEngine(
 
     @Volatile
     private var lastRequestAtMs: Long = 0L
+
+    @Volatile
+    private var onlineCooldownUntilMs: Long = 0L
+
+    @Volatile
+    private var wasOfflineDueToNoNet: Boolean = false
 
     @Volatile
     private var lastErrorReason: String = ""
@@ -535,6 +546,24 @@ class BookTtsEngine(
 
     init {
         initOfflineTts()
+    }
+
+    private fun hasActiveNetwork(): Boolean {
+        return runCatching {
+            val ifaces = NetworkInterface.getNetworkInterfaces() ?: return@runCatching true
+            while (ifaces.hasMoreElements()) {
+                val nif = ifaces.nextElement()
+                if (!nif.isUp || nif.isLoopback) continue
+                val addrs = nif.inetAddresses
+                while (addrs.hasMoreElements()) {
+                    val addr = addrs.nextElement()
+                    if (!addr.isLoopbackAddress && !addr.isLinkLocalAddress) {
+                        return@runCatching true
+                    }
+                }
+            }
+            false
+        }.getOrDefault(true)
     }
 
     private fun acquireWakeLock() {
@@ -559,6 +588,12 @@ class BookTtsEngine(
         runCatching {
             ttsCacheDir.listFiles()?.forEach { it.delete() }
         }
+    }
+
+    private fun cancelPendingFetches() {
+        activeWebSocket.getAndSet(null)?.cancel()
+        prefetchMap.values.forEach { it.cancel(true) }
+        prefetchMap.clear()
     }
 
     private fun buildSegments(paragraphs: List<String>): List<TtsSegment> {
@@ -605,18 +640,52 @@ class BookTtsEngine(
         offlineTts = TextToSpeech(context.applicationContext) { status ->
             if (status == TextToSpeech.SUCCESS) {
                 offlineReady = true
-                offlineTts?.language = Locale("vi", "VN")
-                offlineTts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(utteranceId: String?) {}
-                    override fun onDone(utteranceId: String?) {
-                        advanceFromUtterance(utteranceId)
+                offlineTts?.let { tts ->
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                        tts.setAudioAttributes(
+                            AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_MEDIA)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                .build()
+                        )
                     }
+                    selectBestOfflineVietnameseVoice(tts)
+                    tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                        override fun onStart(utteranceId: String?) {
+                            offlineConsecutiveErrors.set(0)
+                        }
 
-                    @Deprecated("Deprecated in Java")
-                    override fun onError(utteranceId: String?) {
-                        advanceFromUtterance(utteranceId)
-                    }
-                })
+                        override fun onDone(utteranceId: String?) {
+                            offlineConsecutiveErrors.set(0)
+                            advanceFromUtterance(utteranceId)
+                        }
+
+                        @Deprecated("Deprecated in Java")
+                        override fun onError(utteranceId: String?) {
+                            handleOfflineError(utteranceId)
+                        }
+
+                        override fun onError(utteranceId: String?, errorCode: Int) {
+                            handleOfflineError(utteranceId)
+                        }
+                    })
+                }
+            }
+        }
+    }
+
+    private fun selectBestOfflineVietnameseVoice(tts: TextToSpeech) {
+        val viLocale = Locale("vi", "VN")
+        runCatching { tts.setLanguage(viLocale) }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            runCatching {
+                val localVi = tts.voices.orEmpty().firstOrNull { v ->
+                    v.locale?.language.equals("vi", ignoreCase = true) && !v.isNetworkConnectionRequired
+                }
+                if (localVi != null) {
+                    tts.voice = localVi
+                    offlineLocalVoicePicked = true
+                }
             }
         }
     }
@@ -627,6 +696,24 @@ class BookTtsEngine(
         val idx = parts.getOrNull(1)?.toIntOrNull() ?: return
         mainHandler.post {
             if (sess == sessionCounter.get() && isPlaying) {
+                playSegmentInternal(sess, idx + 1)
+            }
+        }
+    }
+
+    private fun handleOfflineError(utteranceId: String?) {
+        val parts = utteranceId?.split("_") ?: return
+        val sess = parts.getOrNull(0)?.toIntOrNull() ?: return
+        val idx = parts.getOrNull(1)?.toIntOrNull() ?: return
+        mainHandler.post {
+            if (sess != sessionCounter.get() || !isPlaying) return@post
+            val errs = offlineConsecutiveErrors.incrementAndGet()
+            if (errs >= 2) {
+                isPlaying = false
+                releaseWakeLock()
+                onStateChanged(false, "Thiếu gói giọng Tiếng Việt Offline")
+                onFallbackNotice("Chưa tải gói giọng Tiếng Việt Offline trong Cài đặt TTS của máy")
+            } else {
                 playSegmentInternal(sess, idx + 1)
             }
         }
@@ -644,12 +731,15 @@ class BookTtsEngine(
         isActive = true
         isPlaying = true
         fallbackNoticeShown = false
+        wasOfflineDueToNoNet = false
+        onlineCooldownUntilMs = 0L
+        offlineConsecutiveErrors.set(0)
         lastErrorReason = ""
         acquireWakeLock()
 
         val session = sessionCounter.incrementAndGet()
         cleanCacheFiles()
-        onStateChanged(true, "Đang tải giọng ${voice.shortLabel}...")
+        onStateChanged(true, "Đang chuẩn bị giọng ${voice.shortLabel}...")
         playSegmentInternal(session, currentSegIndex)
     }
 
@@ -701,6 +791,9 @@ class BookTtsEngine(
         voice = newVoice
         speed = newSpeed
         fallbackNoticeShown = false
+        wasOfflineDueToNoNet = false
+        onlineCooldownUntilMs = 0L
+        offlineConsecutiveErrors.set(0)
         lastErrorReason = ""
         if (isActive && isPlaying) {
             jumpToSegment(currentSegIndex)
@@ -739,8 +832,7 @@ class BookTtsEngine(
     private fun jumpToSegment(idx: Int) {
         currentSegIndex = idx
         stopMediaOnly()
-        prefetchMap.values.forEach { it.cancel(true) }
-        prefetchMap.clear()
+        cancelPendingFetches()
         isPlaying = true
         acquireWakeLock()
         val session = sessionCounter.incrementAndGet()
@@ -752,8 +844,7 @@ class BookTtsEngine(
         isPlaying = false
         if (clearState) isActive = false
         stopMediaOnly()
-        prefetchMap.values.forEach { it.cancel(true) }
-        prefetchMap.clear()
+        cancelPendingFetches()
         releaseWakeLock()
         if (clearState) onStateChanged(false, "")
     }
@@ -785,16 +876,56 @@ class BookTtsEngine(
             return
         }
 
+        // Nếu đoạn này đã tải xong từ trước khi tắt Wi-Fi thì phát luôn file MP3 có sẵn
+        val existingFuture = prefetchMap[index]
+        if (existingFuture != null && existingFuture.isDone && !existingFuture.isCancelled) {
+            val cachedFile = runCatching { existingFuture.get() }.getOrNull()
+            if (cachedFile != null && cachedFile.exists() && cachedFile.length() > 100) {
+                playMp3File(session, index, cachedFile)
+                if (hasActiveNetwork() && System.currentTimeMillis() >= onlineCooldownUntilMs && index + 1 < segments.size) {
+                    ensurePrefetch(session, index + 1)
+                }
+                return
+            }
+        }
+
+        val now = System.currentTimeMillis()
+        val netUp = hasActiveNetwork()
+        if (!netUp || now < onlineCooldownUntilMs) {
+            cancelPendingFetches()
+            if (!netUp) wasOfflineDueToNoNet = true
+            if (!fallbackNoticeShown) {
+                fallbackNoticeShown = true
+                val reason = if (!netUp) "Mất kết nối mạng" else lastErrorReason.ifEmpty { "Giọng AI gián đoạn" }
+                onFallbackNotice("$reason, tự chuyển sang Offline")
+            }
+            playOffline(session, index, seg.text)
+            return
+        }
+
+        // Mạng vừa có trở lại sau khi tắt Wi-Fi -> tự chuyển lại sang giọng AI
+        if (wasOfflineDueToNoNet) {
+            wasOfflineDueToNoNet = false
+            fallbackNoticeShown = false
+            lastErrorReason = ""
+        }
+
         val currentFuture = ensurePrefetch(session, index)
         if (index + 1 < segments.size) ensurePrefetch(session, index + 1)
 
         waitExecutor.execute {
-            val file = runCatching { currentFuture.get(28, TimeUnit.SECONDS) }.getOrNull()
+            val file = runCatching { currentFuture.get(16, TimeUnit.SECONDS) }.getOrNull()
             mainHandler.post {
                 if (session != sessionCounter.get() || !isPlaying) return@post
                 if (file != null && file.exists() && file.length() > 100) {
                     playMp3File(session, index, file)
                 } else {
+                    cancelPendingFetches()
+                    if (!hasActiveNetwork()) {
+                        wasOfflineDueToNoNet = true
+                    } else {
+                        onlineCooldownUntilMs = System.currentTimeMillis() + 45_000L
+                    }
                     if (!fallbackNoticeShown) {
                         fallbackNoticeShown = true
                         val detail = if (lastErrorReason.isNotEmpty()) " ($lastErrorReason)" else ""
@@ -809,7 +940,7 @@ class BookTtsEngine(
     private fun ensurePrefetch(session: Int, index: Int): Future<File?> {
         prefetchMap[index]?.let { return it }
         val future = fetchExecutor.submit(Callable {
-            if (session != sessionCounter.get()) return@Callable null
+            if (session != sessionCounter.get() || !hasActiveNetwork()) return@Callable null
             val seg = segments.getOrNull(index) ?: return@Callable null
             synthesizeEdgeTts(session, index, seg.text, voice.edgeName, speed)
         })
@@ -871,13 +1002,22 @@ class BookTtsEngine(
             isPlaying = false
             return
         }
+        if (!offlineLocalVoicePicked) {
+            selectBestOfflineVietnameseVoice(tts)
+        }
         tts.setSpeechRate(speed)
         onStateChanged(true, "Đang đọc (Offline) • ${index + 1}/${segments.size}")
         val uid = "${session}_${index}"
         val params = Bundle().apply {
             putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, uid)
         }
-        tts.speak(text, TextToSpeech.QUEUE_FLUSH, params, uid)
+        val res = tts.speak(text, TextToSpeech.QUEUE_FLUSH, params, uid)
+        if (res == TextToSpeech.ERROR) {
+            isPlaying = false
+            releaseWakeLock()
+            onStateChanged(false, "Lỗi gọi giọng Offline trên máy")
+            onFallbackNotice("Không phát được giọng Offline (kiểm tra Cài đặt TTS trên máy)")
+        }
     }
 
     private fun buildWsUrl(useNew: Boolean, gec: String, connId: String): String {
@@ -905,7 +1045,12 @@ class BookTtsEngine(
         voiceName: String,
         rateMultiplier: Float
     ): File? {
-        if (session != sessionCounter.get()) return null
+        if (session != sessionCounter.get() || Thread.currentThread().isInterrupted) return null
+        if (!hasActiveNetwork()) {
+            lastErrorReason = "Mất mạng"
+            return null
+        }
+
         val cleanText = escapeXml(text)
         if (cleanText.isBlank()) return null
 
@@ -926,12 +1071,16 @@ class BookTtsEngine(
         var retriedNetwork = false
 
         for (attempt in 0 until 4) {
-            if (session != sessionCounter.get()) return null
+            if (session != sessionCounter.get() || Thread.currentThread().isInterrupted) return null
+            if (!hasActiveNetwork()) {
+                lastErrorReason = "Mất mạng"
+                return null
+            }
 
             val waitGap = 350L - (System.currentTimeMillis() - lastRequestAtMs)
             if (waitGap > 0L) {
                 runCatching { Thread.sleep(waitGap) }
-                if (session != sessionCounter.get()) return null
+                if (session != sessionCounter.get() || Thread.currentThread().isInterrupted) return null
             }
             lastRequestAtMs = System.currentTimeMillis()
 
@@ -1024,7 +1173,16 @@ class BookTtsEngine(
                 }
             })
 
-            val finishedInTime = latch.await(18, TimeUnit.SECONDS)
+            activeWebSocket.set(ws)
+            val finishedInTime = try {
+                latch.await(12, TimeUnit.SECONDS)
+            } catch (_: InterruptedException) {
+                ws.cancel()
+                return null
+            } finally {
+                activeWebSocket.compareAndSet(ws, null)
+            }
+
             if (!finishedInTime) {
                 lastErrorReason = "Timeout"
                 ws.cancel()
@@ -1036,6 +1194,11 @@ class BookTtsEngine(
                     outFile.writeBytes(audioOut.toByteArray())
                     outFile
                 }.getOrNull()
+            }
+
+            if (!hasActiveNetwork()) {
+                lastErrorReason = "Mất mạng"
+                return null
             }
 
             val code = failedHttpCode.get()
