@@ -14,6 +14,7 @@ import android.webkit.WebViewClient
 import android.widget.*
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.text.HtmlCompat
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.io.MemoryUsageSetting
 import com.tom_roush.pdfbox.pdmodel.PDDocument
@@ -35,6 +36,9 @@ class ReaderActivity : AppCompatActivity() {
     private var isPdfMode = false
     private val canUseTts: Boolean get() = !isPageMode || isPdfMode
     private var menuVisible = false
+    private var isActivityVisible = true
+    private var pendingReloadChapterOnResume = false
+    private var pendingRenderPageOnResume = false
     private var themeIndex = 1 // 0: Sáng, 1: Giấy vàng, 2: Xám tối, 3: Đen đêm
     private var fontSizePx = 19
     private var useSerif = true
@@ -114,6 +118,25 @@ class ReaderActivity : AppCompatActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        isActivityVisible = true
+        if (!menuVisible) hideSystemUI()
+        if (pendingReloadChapterOnResume && !isPageMode) {
+            pendingReloadChapterOnResume = false
+            loadChapter(chapterIndex, 0f)
+        }
+        if (pendingRenderPageOnResume && isPageMode) {
+            pendingRenderPageOnResume = false
+            renderPageBitmap(currentPage)
+        }
+    }
+
+    override fun onStop() {
+        isActivityVisible = false
+        super.onStop()
+    }
+
     private fun hideSystemUI() {
         @Suppress("DEPRECATION")
         window.decorView.systemUiVisibility = (
@@ -128,21 +151,44 @@ class ReaderActivity : AppCompatActivity() {
             .coerceIn(0, VoiceOption.entries.lastIndex)
         val savedSpeed = prefs.getFloat("pref_tts_speed", 1.0f)
 
+        TtsServiceBridge.onTogglePlayPause = { ttsEngine?.togglePlayPause() }
+        TtsServiceBridge.onStopPlayback = { stopTtsAndHideBar() }
+        TtsServiceBridge.onPrevSegment = { ttsEngine?.prevSegment() }
+
         ttsEngine = BookTtsEngine(
             context = this,
             onSegmentActive = { domIdx, _, _ ->
-                if (!isPageMode) {
+                if (!isPageMode && isActivityVisible && !pendingReloadChapterOnResume) {
                     webView.evaluateJavascript("window.readM8Highlight($domIdx);", null)
                 }
             },
             onStateChanged = { playing, status ->
                 btnTtsPlayPause?.text = if (playing) "⏸" else "▶"
-                if (status.isNotEmpty()) {
-                    ttsStatusText?.text = if (isPdfMode && totalPages > 0) {
+                val formattedStatus = if (status.isNotEmpty()) {
+                    if (isPdfMode && totalPages > 0) {
                         "Tr.${currentPage + 1}/$totalPages • $status"
                     } else {
                         status
                     }
+                } else {
+                    if (playing) "Đang đọc..." else "Đã tạm dừng"
+                }
+                if (status.isNotEmpty()) {
+                    ttsStatusText?.text = formattedStatus
+                }
+
+                if (ttsEngine?.isActive == true) {
+                    val bookTitle = titleText.text?.toString().orEmpty()
+                        .ifBlank { bookFile.nameWithoutExtension }
+                    TtsPlaybackService.sync(this, bookTitle, formattedStatus, playing)
+                    if (playing) {
+                        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    } else {
+                        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    }
+                } else {
+                    TtsPlaybackService.stop(this)
+                    window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 }
             },
             onChapterFinished = {
@@ -156,8 +202,12 @@ class ReaderActivity : AppCompatActivity() {
                 } else {
                     val book = parsedBook
                     if (book != null && chapterIndex + 1 < book.chapters.size) {
-                        autoStartTtsNextChapter = true
-                        loadChapter(chapterIndex + 1, 0f)
+                        if (isActivityVisible) {
+                            autoStartTtsNextChapter = true
+                            loadChapter(chapterIndex + 1, 0f)
+                        } else {
+                            startNextTextChapterInBackground(chapterIndex + 1)
+                        }
                     } else {
                         Toast.makeText(this, "Đã đọc xong cuốn sách!", Toast.LENGTH_SHORT).show()
                         stopTtsAndHideBar()
@@ -229,7 +279,7 @@ class ReaderActivity : AppCompatActivity() {
             rootFrame.addView(webView)
         }
 
-        // Thanh nghe đọc sách mini (dùng cho cả sách chữ và PDF)
+        // Thanh nghe đọc sách mini ở mép dưới
         if (canUseTts) {
             val bar = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
@@ -290,12 +340,12 @@ class ReaderActivity : AppCompatActivity() {
             rootFrame.addView(bar)
         }
 
-        // Thanh trên cùng
+        // Thanh trên cùng (chỉ đặt nút Quay lại ở góc trái, né hoàn toàn góc trên phải)
         topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setBackgroundColor(Color.parseColor("#EE181820"))
-            setPadding(dp(8), dp(12), dp(8), dp(12))
+            setPadding(dp(8), dp(12), dp(12), dp(12))
             visibility = View.GONE
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
@@ -305,8 +355,7 @@ class ReaderActivity : AppCompatActivity() {
         }
 
         val btnBack = makeBarButton("←") {
-            pdfTtsRequestId.incrementAndGet()
-            ttsEngine?.stop()
+            stopTtsAndHideBar()
             saveProgress()
             finish()
         }
@@ -315,26 +364,13 @@ class ReaderActivity : AppCompatActivity() {
             setTextColor(Color.WHITE)
             textSize = 14f
             maxLines = 1
-            setPadding(dp(8), 0, dp(8), 0)
+            setPadding(dp(10), 0, dp(8), 0)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
         topBar.addView(btnBack)
         topBar.addView(titleText)
 
-        if (canUseTts) {
-            val btnListen = makeBarButton("🎧 Nghe") {
-                if (menuVisible) toggleMenu()
-                startTtsFromCurrentView()
-            }
-            topBar.addView(btnListen)
-        }
-
-        val btnToc = makeBarButton(if (isPageMode) "Trang" else "Mục lục") {
-            if (isPageMode) showJumpPageDialog() else showTocDialog()
-        }
-        topBar.addView(btnToc)
-
-        // Thanh dưới cùng
+        // Thanh dưới cùng (đặt nút Nghe và Mục lục/Chọn trang ngay ở đây)
         bottomBar = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#EE181820"))
@@ -359,7 +395,7 @@ class ReaderActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(8) }
+            ).apply { bottomMargin = dp(10) }
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
                     if (fromUser && isPageMode) {
@@ -370,14 +406,48 @@ class ReaderActivity : AppCompatActivity() {
                 override fun onStopTrackingTouch(sb: SeekBar?) {
                     val p = sb?.progress ?: return
                     if (isPageMode) goToPage(p) else {
-                        ttsEngine?.stop()
-                        ttsBar?.visibility = View.GONE
+                        stopTtsAndHideBar()
                         loadChapter(p, 0f)
                     }
                 }
             })
         }
         bottomBar.addView(pageSeekBar)
+
+        // Hàng thao tác chính phía dưới: Nghe đọc sách + Mục lục/Chọn trang
+        val quickActionsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(8) }
+        }
+
+        if (canUseTts) {
+            val btnListen = makeBarButton("🎧 Nghe đọc sách", "#FFD97706") {
+                if (menuVisible) toggleMenu()
+                startTtsFromCurrentView()
+            }.apply {
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                textSize = 13f
+                setTypeface(null, Typeface.BOLD)
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.3f)
+                    .apply { setMargins(dp(3), 0, dp(3), 0) }
+            }
+            quickActionsRow.addView(btnListen)
+        }
+
+        val btnToc = makeBarButton(if (isPageMode) "📄 Chọn trang" else "📑 Mục lục") {
+            if (isPageMode) showJumpPageDialog() else showTocDialog()
+        }.apply {
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            textSize = 13f
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                .apply { setMargins(dp(3), 0, dp(3), 0) }
+        }
+        quickActionsRow.addView(btnToc)
+        bottomBar.addView(quickActionsRow)
 
         val controlsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -421,7 +491,11 @@ class ReaderActivity : AppCompatActivity() {
         setContentView(rootFrame)
     }
 
-    private fun makeBarButton(label: String, onClick: () -> Unit): TextView {
+    private fun makeBarButton(
+        label: String,
+        bgColorHex: String = "#FF2A2A35",
+        onClick: () -> Unit
+    ): TextView {
         return TextView(this).apply {
             text = label
             setTextColor(Color.WHITE)
@@ -429,7 +503,7 @@ class ReaderActivity : AppCompatActivity() {
             gravity = Gravity.CENTER
             setPadding(dp(10), dp(7), dp(10), dp(7))
             background = GradientDrawable().apply {
-                setColor(Color.parseColor("#FF2A2A35"))
+                setColor(Color.parseColor(bgColorHex))
                 cornerRadius = dp(8).toFloat()
             }
             layoutParams = LinearLayout.LayoutParams(
@@ -462,10 +536,46 @@ class ReaderActivity : AppCompatActivity() {
     private fun stopTtsAndHideBar() {
         pdfTtsRequestId.incrementAndGet()
         ttsEngine?.stop()
+        TtsPlaybackService.stop(this)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         ttsBar?.visibility = View.GONE
-        if (!isPageMode) {
+        if (!isPageMode && isActivityVisible) {
             webView.evaluateJavascript("window.readM8ClearHighlight();", null)
         }
+    }
+
+    private fun startNextTextChapterInBackground(startIdx: Int) {
+        val book = parsedBook ?: return
+        var idx = startIdx
+        while (idx < book.chapters.size) {
+            val ch = book.chapters[idx]
+            val paragraphs = extractHtmlParagraphs(ch.htmlContent)
+            if (paragraphs.isNotEmpty()) {
+                chapterIndex = idx
+                currentScrollRatio = 0f
+                pendingReloadChapterOnResume = true
+                pageSeekBar.progress = idx
+                progressText.text = "${ch.title}  (${idx + 1}/${book.chapters.size})"
+                saveProgress()
+                ttsEngine?.start(paragraphs, 0)
+                return
+            }
+            idx++
+        }
+        Toast.makeText(this, "Đã đọc xong cuốn sách!", Toast.LENGTH_SHORT).show()
+        stopTtsAndHideBar()
+    }
+
+    private fun extractHtmlParagraphs(rawHtml: String): List<String> {
+        val noHead = rawHtml
+            .replace(Regex("<head[^>]*>.*?</head>", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)), "")
+            .replace(Regex("<script[^>]*>.*?</script>", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)), "")
+            .replace(Regex("<style[^>]*>.*?</style>", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)), "")
+            .replace(Regex("</?(p|div|h[1-6]|li|blockquote|tr|br)[^>]*>", RegexOption.IGNORE_CASE), "\n")
+        val plain = HtmlCompat.fromHtml(noHead, HtmlCompat.FROM_HTML_MODE_LEGACY).toString()
+        return plain.split("\n")
+            .map { it.replace(Regex("\\s+"), " ").trim() }
+            .filter { it.length >= 2 }
     }
 
     private fun ensurePdfTextDoc(): PDDocument? {
@@ -830,8 +940,7 @@ class ReaderActivity : AppCompatActivity() {
         AlertDialog.Builder(this)
             .setTitle("Mục lục (${book.chapters.size})")
             .setSingleChoiceItems(titles, chapterIndex) { dialog, which ->
-                ttsEngine?.stop()
-                ttsBar?.visibility = View.GONE
+                stopTtsAndHideBar()
                 loadChapter(which, 0f)
                 dialog.dismiss()
                 if (menuVisible) toggleMenu()
@@ -918,6 +1027,35 @@ class ReaderActivity : AppCompatActivity() {
         }
     }
 
+    private fun renderPageBitmap(index: Int) {
+        renderExecutor.execute {
+            val bmp = runCatching {
+                val renderer = pdfRenderer
+                if (renderer != null) {
+                    renderer.openPage(index).use { page ->
+                        val targetW = (resources.displayMetrics.widthPixels * 1.5f).toInt().coerceAtMost(1600)
+                        val scale = targetW.toFloat() / page.width.coerceAtLeast(1)
+                        val targetH = (page.height * scale).toInt().coerceAtLeast(1)
+                        val out = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
+                        out.eraseColor(Color.WHITE)
+                        page.render(out, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                        out
+                    }
+                } else {
+                    val zip = cbzZip ?: return@runCatching null
+                    val entry = zip.getEntry(cbzEntries[index]) ?: return@runCatching null
+                    zip.getInputStream(entry).use { BitmapFactory.decodeStream(it) }
+                }
+            }.getOrNull()
+
+            runOnUiThread {
+                if (bmp != null && !isFinishing && !isDestroyed) {
+                    pageImageView.setPageBitmap(bmp)
+                }
+            }
+        }
+    }
+
     private fun goToPage(index: Int, autoPlayTts: Boolean = false) {
         if (totalPages <= 0) return
         if (index < 0) {
@@ -940,29 +1078,10 @@ class ReaderActivity : AppCompatActivity() {
         progressText.text = "Trang ${index + 1} / $totalPages"
         saveProgress()
 
-        renderExecutor.execute {
-            val bmp = runCatching {
-                val renderer = pdfRenderer
-                if (renderer != null) {
-                    renderer.openPage(index).use { page ->
-                        val targetW = (resources.displayMetrics.widthPixels * 1.5f).toInt().coerceAtMost(1600)
-                        val scale = targetW.toFloat() / page.width.coerceAtLeast(1)
-                        val targetH = (page.height * scale).toInt().coerceAtLeast(1)
-                        val out = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
-                        out.eraseColor(Color.WHITE)
-                        page.render(out, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                        out
-                    }
-                } else {
-                    val zip = cbzZip ?: return@runCatching null
-                    val entry = zip.getEntry(cbzEntries[index]) ?: return@runCatching null
-                    zip.getInputStream(entry).use { BitmapFactory.decodeStream(it) }
-                }
-            }.getOrNull()
-
-            runOnUiThread {
-                if (bmp != null) pageImageView.setPageBitmap(bmp)
-            }
+        if (isActivityVisible) {
+            renderPageBitmap(index)
+        } else {
+            pendingRenderPageOnResume = true
         }
 
         if (autoPlayTts) {
@@ -1050,6 +1169,10 @@ class ReaderActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         pdfTtsRequestId.incrementAndGet()
+        TtsServiceBridge.onTogglePlayPause = null
+        TtsServiceBridge.onStopPlayback = null
+        TtsServiceBridge.onPrevSegment = null
+        TtsPlaybackService.stop(this)
         ttsEngine?.release()
         pdfTextExecutor.execute {
             runCatching { pdfTextDoc?.close() }
