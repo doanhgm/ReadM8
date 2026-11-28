@@ -513,6 +513,9 @@ class BookTtsEngine(
     private var useNewEndpoint: Boolean = true
 
     @Volatile
+    private var lastRequestAtMs: Long = 0L
+
+    @Volatile
     private var lastErrorReason: String = ""
 
     @Volatile
@@ -563,13 +566,13 @@ class BookTtsEngine(
         for ((domIdx, raw) in paragraphs.withIndex()) {
             val cleaned = raw.replace(Regex("\\s+"), " ").trim()
             if (cleaned.length < 2) continue
-            if (cleaned.length <= 300) {
+            if (cleaned.length <= 520) {
                 out.add(TtsSegment(domIdx, cleaned))
                 continue
             }
             var start = 0
             while (start < cleaned.length) {
-                val maxEnd = (start + 280).coerceAtMost(cleaned.length)
+                val maxEnd = (start + 500).coerceAtMost(cleaned.length)
                 if (maxEnd >= cleaned.length) {
                     out.add(TtsSegment(domIdx, cleaned.substring(start).trim()))
                     break
@@ -584,9 +587,9 @@ class BookTtsEngine(
                 val cutComma = slice.lastIndexOf(", ")
                 val cutSpace = slice.lastIndexOf(' ')
                 val cut = when {
-                    cutSentence > 80 -> start + cutSentence + 1
-                    cutComma > 120 -> start + cutComma + 1
-                    cutSpace > 60 -> start + cutSpace
+                    cutSentence > 150 -> start + cutSentence + 1
+                    cutComma > 220 -> start + cutComma + 1
+                    cutSpace > 100 -> start + cutSpace
                     else -> maxEnd
                 }
                 val part = cleaned.substring(start, cut).trim()
@@ -786,7 +789,7 @@ class BookTtsEngine(
         if (index + 1 < segments.size) ensurePrefetch(session, index + 1)
 
         waitExecutor.execute {
-            val file = runCatching { currentFuture.get(25, TimeUnit.SECONDS) }.getOrNull()
+            val file = runCatching { currentFuture.get(28, TimeUnit.SECONDS) }.getOrNull()
             mainHandler.post {
                 if (session != sessionCounter.get() || !isPlaying) return@post
                 if (file != null && file.exists() && file.length() > 100) {
@@ -925,6 +928,13 @@ class BookTtsEngine(
         for (attempt in 0 until 4) {
             if (session != sessionCounter.get()) return null
 
+            val waitGap = 350L - (System.currentTimeMillis() - lastRequestAtMs)
+            if (waitGap > 0L) {
+                runCatching { Thread.sleep(waitGap) }
+                if (session != sessionCounter.get()) return null
+            }
+            lastRequestAtMs = System.currentTimeMillis()
+
             val gec = EdgeTtsDrm.generateSecMsGecV2()
             val connId = UUID.randomUUID().toString().replace("-", "")
             val muid = UUID.randomUUID().toString().replace("-", "").uppercase(Locale.US)
@@ -945,6 +955,7 @@ class BookTtsEngine(
             val completed = AtomicBoolean(false)
             val failedHttpCode = AtomicInteger(0)
             val failedServerDate = AtomicReference<String?>(null)
+            val failedRetryAfter = AtomicReference<String?>(null)
             val failedNetwork = AtomicBoolean(false)
 
             val ts = utcTimestamp()
@@ -993,6 +1004,7 @@ class BookTtsEngine(
                     if (response != null) {
                         failedHttpCode.set(response.code)
                         failedServerDate.set(response.header("Date"))
+                        failedRetryAfter.set(response.header("Retry-After"))
                         lastErrorReason = "HTTP ${response.code}"
                     } else {
                         failedNetwork.set(true)
@@ -1026,7 +1038,8 @@ class BookTtsEngine(
                 }.getOrNull()
             }
 
-            if (failedHttpCode.get() == 403) {
+            val code = failedHttpCode.get()
+            if (code == 403) {
                 val serverDate = failedServerDate.get()
                 if (serverDate != null && EdgeTtsDrm.adjustClockSkewIfNeeded(serverDate)) {
                     continue
@@ -1036,6 +1049,16 @@ class BookTtsEngine(
                     switchedEndpoint = true
                     continue
                 }
+            } else if (code == 429 || code in 500..599) {
+                val retryAfterSec = failedRetryAfter.get()?.trim()?.toLongOrNull()
+                val delayMs = retryAfterSec?.let { (it * 1000L).coerceIn(600L, 3000L) }
+                    ?: (650L * (attempt + 1)).coerceAtMost(2500L)
+                if (attempt >= 1 && !switchedEndpoint) {
+                    useNewEndpoint = !useNewEndpoint
+                    switchedEndpoint = true
+                }
+                runCatching { Thread.sleep(delayMs) }
+                continue
             } else if (failedNetwork.get()) {
                 if (!switchedEndpoint) {
                     useNewEndpoint = !useNewEndpoint
