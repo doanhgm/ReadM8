@@ -23,21 +23,22 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.net.NetworkInterface
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
-import java.util.concurrent.Callable
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlin.math.abs
 
 enum class VoiceOption(
@@ -481,8 +482,15 @@ class BookTtsEngine(
     private val onChapterFinished: () -> Unit,
     private val onFallbackNotice: (msg: String) -> Unit
 ) {
+    private enum class PlayMode { NONE, AI_MP3, SYSTEM_TTS }
+
+    private companion object {
+        const val MAX_CACHE_BYTES = 150L * 1024 * 1024 // 150 MB (~7+ tiếng đọc AI)
+        const val PRUNE_TARGET_BYTES = 120L * 1024 * 1024
+        const val MIN_VALID_MP3_BYTES = 128L
+    }
+
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val fetchExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val waitExecutor: ExecutorService = Executors.newSingleThreadExecutor()
 
     private val tls12Spec = ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
@@ -497,12 +505,23 @@ class BookTtsEngine(
         .retryOnConnectionFailure(true)
         .build()
 
-    private val ttsCacheDir = File(context.cacheDir, "tts_audio").apply { mkdirs() }
+    // Lưu bền vững trong filesDir để tắt app / tắt Wi-Fi mở lại vẫn còn nguyên giọng AI
+    private val ttsCacheDir = File(context.filesDir, "tts_offline_cache").apply { mkdirs() }
+
     private val sessionCounter = AtomicInteger(0)
+    private val chapterJobId = AtomicInteger(0)
     private val offlineConsecutiveErrors = AtomicInteger(0)
+    private val consecutiveBgErrors = AtomicInteger(0)
+    private val downloadingIndex = AtomicInteger(-1)
+    private val released = AtomicBoolean(false)
     private val activeWebSocket = AtomicReference<WebSocket?>(null)
+
     private val playerLock = Any()
-    private val prefetchMap = ConcurrentHashMap<Int, Future<File?>>()
+    private val cacheLock = ReentrantLock()
+    private val cacheCondition = cacheLock.newCondition()
+
+    private val cachedIndices = ConcurrentHashMap.newKeySet<Int>()
+    private val failedIndices = ConcurrentHashMap.newKeySet<Int>()
 
     private var mediaPlayer: MediaPlayer? = null
     private var offlineTts: TextToSpeech? = null
@@ -510,8 +529,15 @@ class BookTtsEngine(
     private var offlineLocalVoicePicked = false
     private var wakeLock: PowerManager.WakeLock? = null
 
+    @Volatile
     private var segments: List<TtsSegment> = emptyList()
+
+    @Volatile
     private var currentSegIndex = 0
+
+    @Volatile
+    private var currentPlayMode = PlayMode.NONE
+
     private var fallbackNoticeShown = false
 
     @Volatile
@@ -537,15 +563,24 @@ class BookTtsEngine(
     var isPlaying = false
         private set
 
+    @Volatile
     var voice: VoiceOption = VoiceOption.HOAI_MY
+
+    @Volatile
     var speed: Float = 1.0f
 
     private var sleepRunnable: Runnable? = null
     var sleepMinutesLeft: Int = 0
         private set
 
+    private val cacheWorkerThread = Thread({ runCacheLoop() }, "ReadM8-ChapterCache").apply {
+        isDaemon = true
+    }
+
     init {
         initOfflineTts()
+        cacheWorkerThread.start()
+        cleanupLegacyAndTrimAsync()
     }
 
     private fun hasActiveNetwork(): Boolean {
@@ -566,6 +601,246 @@ class BookTtsEngine(
         }.getOrDefault(true)
     }
 
+    private fun rateString(rateMultiplier: Float): String {
+        val pct = ((rateMultiplier - 1.0f) * 100f).toInt().coerceIn(-50, 100)
+        return if (pct >= 0) "+$pct%" else "$pct%"
+    }
+
+    private fun getCacheFile(v: VoiceOption, spd: Float, text: String): File {
+        val key = "${v.edgeName}|${rateString(spd)}|$text"
+        val digest = MessageDigest.getInstance("SHA-256").digest(key.toByteArray(Charsets.UTF_8))
+        val hex = StringBuilder(24)
+        for (i in 0 until 12) {
+            val b = digest[i].toInt() and 0xFF
+            hex.append("0123456789abcdef"[b ushr 4])
+            hex.append("0123456789abcdef"[b and 0x0F])
+        }
+        return File(ttsCacheDir, "ai_$hex.mp3")
+    }
+
+    private fun isValidAudioFile(file: File?): Boolean {
+        return file != null && file.exists() && file.length() >= MIN_VALID_MP3_BYTES
+    }
+
+    private fun scanCachedSegmentsForCurrentChapter() {
+        cachedIndices.clear()
+        failedIndices.clear()
+        val v = voice
+        if (!v.isOnline) return
+        val spd = speed
+        val segs = segments
+        for (i in segs.indices) {
+            if (isValidAudioFile(getCacheFile(v, spd, segs[i].text))) {
+                cachedIndices.add(i)
+            }
+        }
+    }
+
+    private fun isRemainingFullyCached(): Boolean {
+        val segs = segments
+        if (segs.isEmpty()) return false
+        val start = currentSegIndex.coerceIn(0, segs.lastIndex)
+        for (i in start..segs.lastIndex) {
+            if (i !in cachedIndices) return false
+        }
+        return true
+    }
+
+    private fun buildStatusText(): String {
+        val total = segments.size
+        if (total == 0) return ""
+        val idxDisplay = (currentSegIndex + 1).coerceIn(1, total)
+
+        if (!isPlaying) {
+            if (!isActive) return ""
+            return if (voice.isOnline) {
+                val tag = if (isRemainingFullyCached()) {
+                    "Đã lưu offline ✓"
+                } else if (hasActiveNetwork()) {
+                    "Đang lưu offline ${cachedIndices.size}/$total"
+                } else {
+                    "Đã lưu ${cachedIndices.size}/$total"
+                }
+                "Tạm dừng • $tag"
+            } else {
+                "Đã tạm dừng"
+            }
+        }
+
+        return when {
+            !voice.isOnline -> "Đang đọc (Offline) • $idxDisplay/$total"
+            currentPlayMode == PlayMode.SYSTEM_TTS -> "Đang đọc (Giọng máy) • $idxDisplay/$total"
+            else -> {
+                val netUp = hasActiveNetwork()
+                val label = if (netUp) voice.shortLabel else "${voice.shortLabel} (Offline)"
+                val tag = if (isRemainingFullyCached()) {
+                    "Offline ✓"
+                } else {
+                    "Lưu ${cachedIndices.size}/$total"
+                }
+                "Đang đọc ($label) • $idxDisplay/$total • $tag"
+            }
+        }
+    }
+
+    private fun refreshStatusText() {
+        mainHandler.post {
+            if (!isActive) return@post
+            onStateChanged(isPlaying, buildStatusText())
+        }
+    }
+
+    private fun signalCacheWaiters() {
+        cacheLock.withLock {
+            cacheCondition.signalAll()
+        }
+    }
+
+    private fun awaitCacheSignal(timeoutMs: Long) {
+        cacheLock.withLock {
+            runCatching {
+                cacheCondition.await(timeoutMs, TimeUnit.MILLISECONDS)
+            }
+        }
+    }
+
+    private fun cleanupLegacyAndTrimAsync() {
+        Thread {
+            runCatching {
+                // Dọn thư mục tạm cũ nếu còn tồn tại
+                File(context.cacheDir, "tts_audio").listFiles()?.forEach { it.delete() }
+            }
+            trimCacheIfNeeded()
+        }.start()
+    }
+
+    private fun trimCacheIfNeeded() {
+        runCatching {
+            val allFiles = ttsCacheDir.listFiles() ?: return
+            val now = System.currentTimeMillis()
+            val mp3Files = mutableListOf<File>()
+            var totalBytes = 0L
+
+            for (f in allFiles) {
+                if (f.name.endsWith(".tmp")) {
+                    if (now - f.lastModified() > 5 * 60_000L) f.delete()
+                } else if (f.isFile) {
+                    mp3Files.add(f)
+                    totalBytes += f.length()
+                }
+            }
+
+            if (totalBytes <= MAX_CACHE_BYTES) return
+            mp3Files.sortBy { it.lastModified() }
+            for (f in mp3Files) {
+                val len = f.length()
+                if (f.delete()) {
+                    totalBytes -= len
+                }
+                if (totalBytes <= PRUNE_TARGET_BYTES) break
+            }
+        }
+    }
+
+    private fun runCacheLoop() {
+        while (!released.get()) {
+            val jobId = chapterJobId.get()
+            val segs = segments
+            val v = voice
+            val spd = speed
+
+            if (!isActive || !v.isOnline || segs.isEmpty()) {
+                awaitCacheSignal(1500L)
+                continue
+            }
+
+            val now = System.currentTimeMillis()
+            if (!hasActiveNetwork() || now < onlineCooldownUntilMs) {
+                awaitCacheSignal(1500L)
+                continue
+            }
+
+            val curIdx = currentSegIndex.coerceIn(0, segs.lastIndex)
+            var targetIdx = -1
+            for (i in curIdx..segs.lastIndex) {
+                if (i !in cachedIndices && i !in failedIndices) {
+                    targetIdx = i
+                    break
+                }
+            }
+
+            if (targetIdx == -1) {
+                awaitCacheSignal(1500L)
+                continue
+            }
+
+            // Giãn nhịp nhẹ cho các đoạn tải ngầm phía sau để tránh HTTP 429
+            if (targetIdx > currentSegIndex + 1) {
+                awaitCacheSignal(550L)
+                if (released.get() || jobId != chapterJobId.get() || !isActive) continue
+                val latestCur = currentSegIndex.coerceIn(0, segs.lastIndex)
+                if (latestCur < targetIdx && latestCur !in cachedIndices && latestCur !in failedIndices) {
+                    continue
+                }
+            }
+
+            val seg = segs.getOrNull(targetIdx) ?: continue
+            val outFile = getCacheFile(v, spd, seg.text)
+            if (isValidAudioFile(outFile)) {
+                cachedIndices.add(targetIdx)
+                signalCacheWaiters()
+                refreshStatusText()
+                continue
+            }
+
+            downloadingIndex.set(targetIdx)
+            val ok = try {
+                synthesizeEdgeTtsToFile(jobId, targetIdx, seg.text, v.edgeName, spd, outFile)
+            } finally {
+                downloadingIndex.set(-1)
+            }
+
+            if (released.get() || jobId != chapterJobId.get()) {
+                signalCacheWaiters()
+                continue
+            }
+
+            if (ok) {
+                cachedIndices.add(targetIdx)
+                consecutiveBgErrors.set(0)
+                if (wasOfflineDueToNoNet) {
+                    wasOfflineDueToNoNet = false
+                    fallbackNoticeShown = false
+                    lastErrorReason = ""
+                }
+                signalCacheWaiters()
+                refreshStatusText()
+            } else {
+                if (!hasActiveNetwork()) {
+                    wasOfflineDueToNoNet = true
+                    signalCacheWaiters()
+                } else if (targetIdx == currentSegIndex) {
+                    failedIndices.add(targetIdx)
+                    onlineCooldownUntilMs = System.currentTimeMillis() + 30_000L
+                    signalCacheWaiters()
+                } else {
+                    // Nếu đang tải ngầm mà bị ngắt do người dùng nhảy sang đoạn khác thì bỏ qua không tính lỗi
+                    val urgentMoved = currentSegIndex != targetIdx &&
+                        currentSegIndex !in cachedIndices &&
+                        currentSegIndex !in failedIndices
+                    if (!urgentMoved) {
+                        val errs = consecutiveBgErrors.incrementAndGet()
+                        if (errs >= 2) {
+                            onlineCooldownUntilMs = System.currentTimeMillis() + 30_000L
+                            consecutiveBgErrors.set(0)
+                        }
+                    }
+                    signalCacheWaiters()
+                }
+            }
+        }
+    }
+
     private fun acquireWakeLock() {
         runCatching {
             if (wakeLock == null) {
@@ -584,16 +859,8 @@ class BookTtsEngine(
         }
     }
 
-    private fun cleanCacheFiles() {
-        runCatching {
-            ttsCacheDir.listFiles()?.forEach { it.delete() }
-        }
-    }
-
-    private fun cancelPendingFetches() {
+    private fun cancelActiveWebSocket() {
         activeWebSocket.getAndSet(null)?.cancel()
-        prefetchMap.values.forEach { it.cancel(true) }
-        prefetchMap.clear()
     }
 
     private fun buildSegments(paragraphs: List<String>): List<TtsSegment> {
@@ -712,7 +979,7 @@ class BookTtsEngine(
                 isPlaying = false
                 releaseWakeLock()
                 onStateChanged(false, "Thiếu gói giọng Tiếng Việt Offline")
-                onFallbackNotice("Chưa tải gói giọng Tiếng Việt Offline trong Cài đặt TTS của máy")
+                onFallbackNotice("Chưa có giọng Tiếng Việt Offline trên máy")
             } else {
                 playSegmentInternal(sess, idx + 1)
             }
@@ -730,17 +997,23 @@ class BookTtsEngine(
         currentSegIndex = if (found >= 0) found else 0
         isActive = true
         isPlaying = true
+        currentPlayMode = PlayMode.NONE
         fallbackNoticeShown = false
         wasOfflineDueToNoNet = false
         onlineCooldownUntilMs = 0L
         offlineConsecutiveErrors.set(0)
+        consecutiveBgErrors.set(0)
         lastErrorReason = ""
         acquireWakeLock()
 
+        scanCachedSegmentsForCurrentChapter()
+        chapterJobId.incrementAndGet()
         val session = sessionCounter.incrementAndGet()
-        cleanCacheFiles()
+        signalCacheWaiters()
+
         onStateChanged(true, "Đang chuẩn bị giọng ${voice.shortLabel}...")
         playSegmentInternal(session, currentSegIndex)
+        Thread { trimCacheIfNeeded() }.start()
     }
 
     fun togglePlayPause() {
@@ -754,14 +1027,14 @@ class BookTtsEngine(
             }
             runCatching { offlineTts?.stop() }
             releaseWakeLock()
-            onStateChanged(false, "Đã tạm dừng")
+            onStateChanged(false, buildStatusText())
         } else {
             isPlaying = true
             acquireWakeLock()
             var resumed = false
             synchronized(playerLock) {
                 val mp = mediaPlayer
-                if (mp != null && voice.isOnline) {
+                if (mp != null && voice.isOnline && currentPlayMode == PlayMode.AI_MP3) {
                     resumed = runCatching {
                         mp.start()
                         true
@@ -769,7 +1042,8 @@ class BookTtsEngine(
                 }
             }
             if (resumed) {
-                onStateChanged(true, "Đang đọc (${voice.shortLabel})")
+                onStateChanged(true, buildStatusText())
+                signalCacheWaiters()
             } else {
                 val session = sessionCounter.incrementAndGet()
                 playSegmentInternal(session, currentSegIndex)
@@ -794,9 +1068,16 @@ class BookTtsEngine(
         wasOfflineDueToNoNet = false
         onlineCooldownUntilMs = 0L
         offlineConsecutiveErrors.set(0)
+        consecutiveBgErrors.set(0)
         lastErrorReason = ""
+        cancelActiveWebSocket()
+        scanCachedSegmentsForCurrentChapter()
+        chapterJobId.incrementAndGet()
+        signalCacheWaiters()
         if (isActive && isPlaying) {
             jumpToSegment(currentSegIndex)
+        } else if (isActive) {
+            refreshStatusText()
         }
     }
 
@@ -820,19 +1101,19 @@ class BookTtsEngine(
     }
 
     fun release() {
+        released.set(true)
         stopInternal(clearState = true)
         sleepRunnable?.let { mainHandler.removeCallbacks(it) }
-        fetchExecutor.shutdownNow()
+        signalCacheWaiters()
+        cacheWorkerThread.interrupt()
         waitExecutor.shutdownNow()
         runCatching { offlineTts?.shutdown() }
         offlineTts = null
-        cleanCacheFiles()
     }
 
     private fun jumpToSegment(idx: Int) {
         currentSegIndex = idx
         stopMediaOnly()
-        cancelPendingFetches()
         isPlaying = true
         acquireWakeLock()
         val session = sessionCounter.incrementAndGet()
@@ -841,10 +1122,13 @@ class BookTtsEngine(
 
     private fun stopInternal(clearState: Boolean) {
         sessionCounter.incrementAndGet()
+        chapterJobId.incrementAndGet()
         isPlaying = false
         if (clearState) isActive = false
+        currentPlayMode = PlayMode.NONE
         stopMediaOnly()
-        cancelPendingFetches()
+        cancelActiveWebSocket()
+        signalCacheWaiters()
         releaseWakeLock()
         if (clearState) onStateChanged(false, "")
     }
@@ -876,60 +1160,75 @@ class BookTtsEngine(
             return
         }
 
-        // Nếu đoạn này đã tải xong từ trước khi tắt Wi-Fi thì phát luôn file MP3 có sẵn
-        val existingFuture = prefetchMap[index]
-        if (existingFuture != null && existingFuture.isDone && !existingFuture.isCancelled) {
-            val cachedFile = runCatching { existingFuture.get() }.getOrNull()
-            if (cachedFile != null && cachedFile.exists() && cachedFile.length() > 100) {
-                playMp3File(session, index, cachedFile)
-                if (hasActiveNetwork() && System.currentTimeMillis() >= onlineCooldownUntilMs && index + 1 < segments.size) {
-                    ensurePrefetch(session, index + 1)
-                }
-                return
-            }
+        // 1. Ưu tiên phát ngay file giọng AI đã lưu sẵn trên máy (kể cả khi tắt Wi-Fi)
+        val cacheFile = getCacheFile(voice, speed, seg.text)
+        if (isValidAudioFile(cacheFile)) {
+            cachedIndices.add(index)
+            runCatching { cacheFile.setLastModified(System.currentTimeMillis()) }
+            playMp3File(session, index, cacheFile)
+            signalCacheWaiters()
+            return
         }
 
+        // 2. Chưa có trong bộ nhớ máy -> kiểm tra mạng
         val now = System.currentTimeMillis()
         val netUp = hasActiveNetwork()
         if (!netUp || now < onlineCooldownUntilMs) {
-            cancelPendingFetches()
             if (!netUp) wasOfflineDueToNoNet = true
             if (!fallbackNoticeShown) {
                 fallbackNoticeShown = true
-                val reason = if (!netUp) "Mất kết nối mạng" else lastErrorReason.ifEmpty { "Giọng AI gián đoạn" }
-                onFallbackNotice("$reason, tự chuyển sang Offline")
+                val notice = when {
+                    !netUp && cachedIndices.isNotEmpty() -> "Hết đoạn AI đã lưu, chuyển sang giọng máy"
+                    !netUp -> "Mất kết nối mạng, chuyển sang giọng máy"
+                    lastErrorReason.isNotEmpty() -> "Giọng AI gián đoạn ($lastErrorReason), chuyển sang giọng máy"
+                    else -> "Giọng AI gián đoạn, chuyển sang giọng máy"
+                }
+                onFallbackNotice(notice)
             }
             playOffline(session, index, seg.text)
             return
         }
 
-        // Mạng vừa có trở lại sau khi tắt Wi-Fi -> tự chuyển lại sang giọng AI
         if (wasOfflineDueToNoNet) {
             wasOfflineDueToNoNet = false
             fallbackNoticeShown = false
             lastErrorReason = ""
         }
 
-        val currentFuture = ensurePrefetch(session, index)
-        if (index + 1 < segments.size) ensurePrefetch(session, index + 1)
+        // 3. Có mạng: đẩy đoạn hiện tại lên ưu tiên cao nhất và chờ tải xong
+        failedIndices.remove(index)
+        val currentlyDownloading = downloadingIndex.get()
+        if (currentlyDownloading != -1 && currentlyDownloading != index) {
+            cancelActiveWebSocket()
+        }
+        signalCacheWaiters()
+        onStateChanged(true, "Đang tải (${voice.shortLabel}) • ${index + 1}/${segments.size}")
 
         waitExecutor.execute {
-            val file = runCatching { currentFuture.get(16, TimeUnit.SECONDS) }.getOrNull()
+            val deadline = System.currentTimeMillis() + 16_000L
+            while (System.currentTimeMillis() < deadline) {
+                if (session != sessionCounter.get() || !isPlaying || released.get()) return@execute
+                if (isValidAudioFile(cacheFile)) break
+                if (index in failedIndices) break
+                if (!hasActiveNetwork() || System.currentTimeMillis() < onlineCooldownUntilMs) break
+                awaitCacheSignal(300L)
+            }
+
             mainHandler.post {
                 if (session != sessionCounter.get() || !isPlaying) return@post
-                if (file != null && file.exists() && file.length() > 100) {
-                    playMp3File(session, index, file)
+                if (isValidAudioFile(cacheFile)) {
+                    cachedIndices.add(index)
+                    playMp3File(session, index, cacheFile)
                 } else {
-                    cancelPendingFetches()
                     if (!hasActiveNetwork()) {
                         wasOfflineDueToNoNet = true
-                    } else {
-                        onlineCooldownUntilMs = System.currentTimeMillis() + 45_000L
+                    } else if (System.currentTimeMillis() >= onlineCooldownUntilMs) {
+                        onlineCooldownUntilMs = System.currentTimeMillis() + 30_000L
                     }
                     if (!fallbackNoticeShown) {
                         fallbackNoticeShown = true
                         val detail = if (lastErrorReason.isNotEmpty()) " ($lastErrorReason)" else ""
-                        onFallbackNotice("Giọng AI gián đoạn$detail, chuyển sang Offline")
+                        onFallbackNotice("Giọng AI gián đoạn$detail, chuyển sang giọng máy")
                     }
                     playOffline(session, index, seg.text)
                 }
@@ -937,24 +1236,10 @@ class BookTtsEngine(
         }
     }
 
-    private fun ensurePrefetch(session: Int, index: Int): Future<File?> {
-        prefetchMap[index]?.let { return it }
-        val future = fetchExecutor.submit(Callable {
-            if (session != sessionCounter.get() || !hasActiveNetwork()) return@Callable null
-            val seg = segments.getOrNull(index) ?: return@Callable null
-            synthesizeEdgeTts(session, index, seg.text, voice.edgeName, speed)
-        })
-        val existing = prefetchMap.putIfAbsent(index, future)
-        if (existing != null) {
-            future.cancel(true)
-            return existing
-        }
-        return future
-    }
-
     private fun playMp3File(session: Int, index: Int, file: File) {
         stopMediaOnly()
-        onStateChanged(true, "Đang đọc (${voice.shortLabel}) • ${index + 1}/${segments.size}")
+        currentPlayMode = PlayMode.AI_MP3
+        onStateChanged(true, buildStatusText())
         try {
             val mp = MediaPlayer().apply {
                 setAudioAttributes(
@@ -965,8 +1250,6 @@ class BookTtsEngine(
                 )
                 setDataSource(file.absolutePath)
                 setOnCompletionListener {
-                    runCatching { file.delete() }
-                    prefetchMap.remove(index)
                     mainHandler.post {
                         if (session == sessionCounter.get() && isPlaying) {
                             playSegmentInternal(session, index + 1)
@@ -974,8 +1257,9 @@ class BookTtsEngine(
                     }
                 }
                 setOnErrorListener { _, _, _ ->
+                    // File lỗi -> xóa để lần sau tải lại
                     runCatching { file.delete() }
-                    prefetchMap.remove(index)
+                    cachedIndices.remove(index)
                     mainHandler.post {
                         if (session == sessionCounter.get() && isPlaying) {
                             playSegmentInternal(session, index + 1)
@@ -990,12 +1274,15 @@ class BookTtsEngine(
                 mediaPlayer = mp
             }
         } catch (_: Exception) {
+            runCatching { file.delete() }
+            cachedIndices.remove(index)
             playOffline(session, index, segments[index].text)
         }
     }
 
     private fun playOffline(session: Int, index: Int, text: String) {
         stopMediaOnly()
+        currentPlayMode = PlayMode.SYSTEM_TTS
         val tts = offlineTts
         if (!offlineReady || tts == null) {
             onStateChanged(false, "Máy chưa có bộ giọng đọc Offline")
@@ -1006,7 +1293,7 @@ class BookTtsEngine(
             selectBestOfflineVietnameseVoice(tts)
         }
         tts.setSpeechRate(speed)
-        onStateChanged(true, "Đang đọc (Offline) • ${index + 1}/${segments.size}")
+        onStateChanged(true, buildStatusText())
         val uid = "${session}_${index}"
         val params = Bundle().apply {
             putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, uid)
@@ -1038,25 +1325,24 @@ class BookTtsEngine(
         }
     }
 
-    private fun synthesizeEdgeTts(
-        session: Int,
+    private fun synthesizeEdgeTtsToFile(
+        jobId: Int,
         index: Int,
         text: String,
         voiceName: String,
-        rateMultiplier: Float
-    ): File? {
-        if (session != sessionCounter.get() || Thread.currentThread().isInterrupted) return null
+        rateMultiplier: Float,
+        outFile: File
+    ): Boolean {
+        if (released.get() || jobId != chapterJobId.get() || Thread.currentThread().isInterrupted) return false
         if (!hasActiveNetwork()) {
             lastErrorReason = "Mất mạng"
-            return null
+            return false
         }
 
         val cleanText = escapeXml(text)
-        if (cleanText.isBlank()) return null
+        if (cleanText.isBlank()) return false
 
-        val pct = ((rateMultiplier - 1.0f) * 100f).toInt().coerceIn(-50, 100)
-        val rateStr = if (pct >= 0) "+$pct%" else "$pct%"
-
+        val rateStr = rateString(rateMultiplier)
         val metaJson = JSONObject()
             .put("sentenceBoundaryEnabled", "false")
             .put("wordBoundaryEnabled", "false")
@@ -1071,16 +1357,21 @@ class BookTtsEngine(
         var retriedNetwork = false
 
         for (attempt in 0 until 4) {
-            if (session != sessionCounter.get() || Thread.currentThread().isInterrupted) return null
+            if (released.get() || jobId != chapterJobId.get() || Thread.currentThread().isInterrupted) return false
+            if (index != currentSegIndex && isPlaying &&
+                currentSegIndex !in cachedIndices && currentSegIndex !in failedIndices
+            ) {
+                return false
+            }
             if (!hasActiveNetwork()) {
                 lastErrorReason = "Mất mạng"
-                return null
+                return false
             }
 
             val waitGap = 350L - (System.currentTimeMillis() - lastRequestAtMs)
             if (waitGap > 0L) {
-                runCatching { Thread.sleep(waitGap) }
-                if (session != sessionCounter.get() || Thread.currentThread().isInterrupted) return null
+                awaitCacheSignal(waitGap)
+                if (released.get() || jobId != chapterJobId.get() || Thread.currentThread().isInterrupted) return false
             }
             lastRequestAtMs = System.currentTimeMillis()
 
@@ -1178,7 +1469,7 @@ class BookTtsEngine(
                 latch.await(12, TimeUnit.SECONDS)
             } catch (_: InterruptedException) {
                 ws.cancel()
-                return null
+                return false
             } finally {
                 activeWebSocket.compareAndSet(ws, null)
             }
@@ -1188,17 +1479,23 @@ class BookTtsEngine(
                 ws.cancel()
             }
 
-            if (completed.get() && audioOut.size() >= 100 && session == sessionCounter.get()) {
-                val outFile = File(ttsCacheDir, "tts_${session}_${index}.mp3")
-                return runCatching {
-                    outFile.writeBytes(audioOut.toByteArray())
-                    outFile
-                }.getOrNull()
+            if (completed.get() && audioOut.size() >= MIN_VALID_MP3_BYTES) {
+                val saved = runCatching {
+                    val tmpFile = File(ttsCacheDir, "${outFile.name}.${UUID.randomUUID().toString().take(6)}.tmp")
+                    tmpFile.writeBytes(audioOut.toByteArray())
+                    if (outFile.exists()) outFile.delete()
+                    if (!tmpFile.renameTo(outFile)) {
+                        outFile.writeBytes(tmpFile.readBytes())
+                        tmpFile.delete()
+                    }
+                    isValidAudioFile(outFile)
+                }.getOrDefault(false)
+                if (saved) return true
             }
 
             if (!hasActiveNetwork()) {
                 lastErrorReason = "Mất mạng"
-                return null
+                return false
             }
 
             val code = failedHttpCode.get()
@@ -1220,24 +1517,24 @@ class BookTtsEngine(
                     useNewEndpoint = !useNewEndpoint
                     switchedEndpoint = true
                 }
-                runCatching { Thread.sleep(delayMs) }
+                awaitCacheSignal(delayMs)
                 continue
             } else if (failedNetwork.get()) {
                 if (!switchedEndpoint) {
                     useNewEndpoint = !useNewEndpoint
                     switchedEndpoint = true
-                    runCatching { Thread.sleep(250) }
+                    awaitCacheSignal(250L)
                     continue
                 }
                 if (!retriedNetwork) {
                     retriedNetwork = true
-                    runCatching { Thread.sleep(350) }
+                    awaitCacheSignal(350L)
                     continue
                 }
             }
             break
         }
-        return null
+        return false
     }
 
     private fun utcTimestamp(): String {
